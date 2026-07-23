@@ -1,0 +1,65 @@
+@tool
+extends EditorPlugin
+
+const PANEL_PATH := "res://addons/edgegap/ui/edgegap_panel.gd"
+
+var _panel: ScrollContainer
+var _menu_button: Button
+
+func _enter_tree() -> void:
+	# REPLACE_DEEP avoids keeping a previously failed parse cached in ResourceLoader.
+	var panel_script := ResourceLoader.load(
+		PANEL_PATH,
+		"GDScript",
+		ResourceLoader.CACHE_MODE_REPLACE_DEEP
+	) as GDScript
+	if panel_script == null:
+		push_error("Edgegap: failed to load %s" % PANEL_PATH)
+		return
+
+	var reload_err := panel_script.reload()
+	if reload_err != OK:
+		push_error(
+			"Edgegap: panel script reload failed (%s). Open %s and check Output for parse errors." % [
+				error_string(reload_err), PANEL_PATH
+			]
+		)
+		return
+	if not panel_script.can_instantiate():
+		push_error(
+			"Edgegap: panel script cannot be instantiated. Open %s and check Output for parse errors." % PANEL_PATH
+		)
+		return
+
+	_panel = panel_script.new() as ScrollContainer
+	_panel.name = "Edgegap"
+	_panel.custom_minimum_size = Vector2(160, 0)
+	add_control_to_dock(DOCK_SLOT_RIGHT_UL, _panel)
+
+	_menu_button = Button.new()
+	_menu_button.text = "Edgegap"
+	_menu_button.pressed.connect(_focus_dock)
+	add_control_to_container(CONTAINER_TOOLBAR, _menu_button)
+
+	add_tool_menu_item("Edgegap…", _focus_dock)
+
+func _exit_tree() -> void:
+	remove_tool_menu_item("Edgegap…")
+	if _menu_button:
+		remove_control_from_container(CONTAINER_TOOLBAR, _menu_button)
+		_menu_button.queue_free()
+		_menu_button = null
+	if _panel:
+		remove_control_from_docks(_panel)
+		_panel.queue_free()
+		_panel = null
+
+func _focus_dock() -> void:
+	if _panel == null:
+		return
+	var parent := _panel.get_parent()
+	if parent is TabContainer:
+		var tabs := parent as TabContainer
+		var idx := tabs.get_tab_idx_from_control(_panel)
+		if idx >= 0:
+			tabs.current_tab = idx
