@@ -10,7 +10,7 @@ Supports **Godot 4.x** on **Windows**, **macOS**, and **Ubuntu**.
    so you end up with `res://addons/edgegap/plugin.cfg`  
    (do **not** copy the whole git repo as `addons/edgegap-godot/...`).
 2. Project → Project Settings → Plugins → enable **Edgegap**.
-3. Open the **Edgegap** dock (right side, with Inspector) via the toolbar button or **Project → Tools → Edgegap…**. You can drag the dock tab like any other editor panel.
+3. Open the **Edgegap** dock (right side, with Inspector) or via **Project → Tools → Edgegap…**. You can drag the dock tab like any other editor panel.
 
 ## What it does (v0.1)
 
@@ -20,8 +20,9 @@ Supports **Godot 4.x** on **Windows**, **macOS**, and **Ubuntu**.
 3. **Export** using preset `Edgegap Linux Server` (created if missing) via headless `--export-debug`.
 4. **Containerize** with the bundled Dockerfile (`addons/edgegap/defaults/Dockerfile`).
 5. **Run / terminate** local Docker containers started by the plugin.
+6. **Upload** to Edgegap registry (`docker login` + `docker push`), then open the dashboard create-version URL (the application is created there automatically).
 
-Upload & cloud deploy come in a later version.
+Cloud deploy comes in a later version.
 
 ## Notes
 

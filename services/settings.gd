@@ -15,7 +15,7 @@ static func ensure_defaults() -> void:
 	_ensure_setting(es, EdgegapConstants.SETTINGS_REGISTRY_PROJECT, "")
 	_ensure_setting(es, EdgegapConstants.SETTINGS_REGISTRY_USERNAME, "")
 	_ensure_setting(es, EdgegapConstants.SETTINGS_REGISTRY_TOKEN, "")
-	_ensure_setting(es, EdgegapConstants.SETTINGS_LOCAL_CONTAINERS, PackedStringArray())
+	_ensure_setting(es, EdgegapConstants.SETTINGS_LOCAL_CONTAINER_ID, "")
 
 static func _ensure_setting(es: EditorSettings, key: String, default_value: Variant) -> void:
 	if not es.has_setting(key):
@@ -29,7 +29,6 @@ static func set_token(token: String) -> void:
 	var es := _editor_settings()
 	es.set_setting(EdgegapConstants.SETTINGS_TOKEN, token)
 	es.set_setting(EdgegapConstants.SETTINGS_TOKEN_VERIFIED, not token.is_empty())
-	es.save()
 
 static func clear_token() -> void:
 	set_token("")
@@ -45,7 +44,6 @@ static func set_registry_credentials(credentials: Dictionary) -> void:
 	es.set_setting(EdgegapConstants.SETTINGS_REGISTRY_PROJECT, str(credentials.get("project", "")))
 	es.set_setting(EdgegapConstants.SETTINGS_REGISTRY_USERNAME, str(credentials.get("username", "")))
 	es.set_setting(EdgegapConstants.SETTINGS_REGISTRY_TOKEN, str(credentials.get("token", "")))
-	es.save()
 
 static func clear_registry_credentials() -> void:
 	set_registry_credentials({})
@@ -62,23 +60,14 @@ static func has_registry_credentials() -> bool:
 	var creds := get_registry_credentials()
 	return not str(creds.registry_url).is_empty() and not str(creds.username).is_empty()
 
-static func get_local_containers() -> PackedStringArray:
-	var value = _editor_settings().get_setting(EdgegapConstants.SETTINGS_LOCAL_CONTAINERS)
-	if value is PackedStringArray:
-		return value
-	return PackedStringArray()
+static func get_local_container_id() -> String:
+	return str(_editor_settings().get_setting(EdgegapConstants.SETTINGS_LOCAL_CONTAINER_ID))
 
-static func set_local_containers(ids: PackedStringArray) -> void:
-	var es := _editor_settings()
-	es.set_setting(EdgegapConstants.SETTINGS_LOCAL_CONTAINERS, ids)
-	es.save()
+static func set_local_container_id(container_id: String) -> void:
+	_editor_settings().set_setting(EdgegapConstants.SETTINGS_LOCAL_CONTAINER_ID, container_id)
 
-static func add_local_container(container_id: String) -> void:
-	var ids := get_local_containers()
-	if container_id.is_empty() or container_id in ids:
-		return
-	ids.append(container_id)
-	set_local_containers(ids)
+static func clear_local_container_id() -> void:
+	set_local_container_id("")
 
 static func default_image_name() -> String:
 	var name := String(ProjectSettings.get_setting("application/config/name", "godot-server"))
@@ -90,8 +79,31 @@ static func default_image_name() -> String:
 static func default_dockerfile_path() -> String:
 	return ProjectSettings.globalize_path(EdgegapPaths.dockerfile_res_path())
 
+static func is_arm_cpu() -> bool:
+	if OS.has_feature("arm64") or OS.has_feature("arm32"):
+		return true
+	var arch := Engine.get_architecture_name().to_lower()
+	if arch.begins_with("arm") or arch == "aarch64":
+		return true
+	var cpu := OS.get_processor_name().to_lower()
+	if "apple m" in cpu or "snapdragon" in cpu:
+		return true
+	# Catch Apple Silicon even when the editor runs under Rosetta (x86_64).
+	if OS.get_name() == "macOS":
+		var out: Array = []
+		OS.execute("uname", PackedStringArray(["-m"]), out, true, false)
+		var machine := " ".join(PackedStringArray(out)).to_lower()
+		if "arm" in machine or "aarch64" in machine:
+			return true
+	return false
+
+static func default_docker_build_params() -> String:
+	if is_arm_cpu():
+		return EdgegapConstants.DOCKER_ARM_PLATFORM
+	return ""
+
 static func default_docker_run_params() -> String:
-	return "-p %d:%d/udp" % [EdgegapConstants.DEFAULT_SERVER_PORT, EdgegapConstants.DEFAULT_SERVER_PORT]
+	return "-p %d/udp" % EdgegapConstants.DEFAULT_SERVER_PORT
 
 static func unity_style_timestamp_tag() -> String:
 	var utc := Time.get_datetime_dict_from_system(true)

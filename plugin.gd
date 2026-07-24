@@ -1,10 +1,9 @@
-@tool
+﻿@tool
 extends EditorPlugin
 
 const PANEL_PATH := "res://addons/edgegap/ui/edgegap_panel.gd"
 
 var _panel: ScrollContainer
-var _menu_button: Button
 
 func _enter_tree() -> void:
 	# REPLACE_DEEP avoids keeping a previously failed parse cached in ResourceLoader.
@@ -36,19 +35,10 @@ func _enter_tree() -> void:
 	_panel.custom_minimum_size = Vector2(160, 0)
 	add_control_to_dock(DOCK_SLOT_RIGHT_UL, _panel)
 
-	_menu_button = Button.new()
-	_menu_button.text = "Edgegap"
-	_menu_button.pressed.connect(_focus_dock)
-	add_control_to_container(CONTAINER_TOOLBAR, _menu_button)
-
 	add_tool_menu_item("Edgegap…", _focus_dock)
 
 func _exit_tree() -> void:
 	remove_tool_menu_item("Edgegap…")
-	if _menu_button:
-		remove_control_from_container(CONTAINER_TOOLBAR, _menu_button)
-		_menu_button.queue_free()
-		_menu_button = null
 	if _panel:
 		remove_control_from_docks(_panel)
 		_panel.queue_free()
