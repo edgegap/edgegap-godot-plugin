@@ -1,33 +1,28 @@
-# Edgegap for Godot
+# Edgegap Godot plugin for Dedicated Servers quickstart
 
 Editor plugin to export a Linux dedicated server, containerize it with Docker, upload to Edgegap, and deploy a quickstart server.
 
-Supports **Godot 4.x** on **Windows**, **macOS**, and **Ubuntu**.
+Supports **Godot 4.x** on **Windows**, **macOS**, and **Linux**.
+
+This plugin is intended to help you:
+
+- get started quickly with Dedicated Servers on Edgegap,
+- make your server build iteration as fast as possible,
+- make multiplayer development 10x easier by removing the need to learn Linux, Docker, or Cloud concepts.
+
+This plugin does not need to be included in your builds, as it's only a development tool and does not have any runtime features.
+
+Video tutorial is coming soon, stay tuned for updates!
 
 ## Install
 
-1. Copy **only** the `edgegap` folder into your Godot project's `addons/` directory  
-   so you end up with `res://addons/edgegap/plugin.cfg`  
-   (do **not** copy the whole git repo as `addons/edgegap-godot/...`).
-2. Project → Project Settings → Plugins → enable **Edgegap**.
-3. Open the **Edgegap** dock (right side, with Inspector) or via **Project → Tools → Edgegap…**. You can drag the dock tab like any other editor panel.
+[Please refer to the official guide for installation instructions.](https://docs.edgegap.com/godot)
 
-## What it does
+## Other sources
 
-1. **Sign in** with an Edgegap API token (stored in EditorSettings, not in your project repo).
-   Verification matches the Unity plugin: `POST /v1/wizard/init-quick-start` then `GET /v1/wizard/registry-credentials`.
-2. **Validate / install** Linux debug & release export templates.
-3. **Export** using preset `Edgegap Linux Server` (created if missing) via headless `--export-debug`.
-4. **Containerize** with the bundled Dockerfile (`addons/edgegap/defaults/Dockerfile`).
-5. **Run / terminate** local Docker containers started by the plugin.
-6. **Upload** to Edgegap registry (`docker login` + `docker push`), then open the dashboard create-version URL (the application is created there automatically).
-7. **Deploy** to Edgegap cloud (`POST /v2/deployments` with your public IP + `quickstart` tag), open the deployments dashboard, and poll until `Status.READY`. **Stop last deployment** finds quickstart deployments and deletes them until gone (`410`).
+The only other official distribution channels for this plugin are:
+- [The official Godot Asset Store plugin.](https://store.godotengine.org/asset/edgegap/edgegap-servers-quickstart)
 
-## Notes
+## Next Steps
 
-- Default export path: `build/edgegap-linux-server.x86_64`
-- Default local publish: UDP `7777`
-- Docker must be on `PATH`
-- Free Tier: 1 concurrent deployment and 60 minutes runtime per instance
-- API token: [Edgegap user settings](https://app.edgegap.com/user-settings?tab=tokens)
-- Discord: https://discord.com/invite/NgCnkHbsGp
+[Please refer to the official guide for Getting Started.](https://docs.edgegap.com/godot)
