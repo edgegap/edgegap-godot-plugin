@@ -16,6 +16,7 @@ static func ensure_defaults() -> void:
 	_ensure_setting(es, EdgegapConstants.SETTINGS_REGISTRY_USERNAME, "")
 	_ensure_setting(es, EdgegapConstants.SETTINGS_REGISTRY_TOKEN, "")
 	_ensure_setting(es, EdgegapConstants.SETTINGS_LOCAL_CONTAINER_ID, "")
+	_ensure_setting(es, EdgegapConstants.SETTINGS_LAST_DEPLOYMENT_ID, "")
 
 static func _ensure_setting(es: EditorSettings, key: String, default_value: Variant) -> void:
 	if not es.has_setting(key):
@@ -68,6 +69,15 @@ static func set_local_container_id(container_id: String) -> void:
 
 static func clear_local_container_id() -> void:
 	set_local_container_id("")
+
+static func get_last_deployment_id() -> String:
+	return str(_editor_settings().get_setting(EdgegapConstants.SETTINGS_LAST_DEPLOYMENT_ID))
+
+static func set_last_deployment_id(request_id: String) -> void:
+	_editor_settings().set_setting(EdgegapConstants.SETTINGS_LAST_DEPLOYMENT_ID, request_id)
+
+static func clear_last_deployment_id() -> void:
+	set_last_deployment_id("")
 
 static func default_image_name() -> String:
 	var name := String(ProjectSettings.get_setting("application/config/name", "godot-server"))

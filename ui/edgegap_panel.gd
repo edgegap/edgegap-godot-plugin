@@ -10,6 +10,7 @@ const PresetScript = preload("../services/export_preset.gd")
 const ExportScript = preload("../services/headless_export.gd")
 const DockerScript = preload("../services/docker.gd")
 const AppApiScript = preload("../services/app_api.gd")
+const DeploymentsApiScript = preload("../services/deployments_api.gd")
 const PathsScript = preload("../services/paths.gd")
 const RevertibleFieldScript = preload("revertible_field.gd")
 const ActionStatusScript = preload("action_status.gd")
@@ -32,6 +33,7 @@ var _containerize_status
 var _rebuild_status
 var _local_status
 var _upload_status
+var _deploy_status
 
 var _install_templates_btn := Button.new()
 var _validate_templates_btn := Button.new()
@@ -43,6 +45,10 @@ var _deploy_local_btn := Button.new()
 var _terminate_local_btn := Button.new()
 var _upload_btn := Button.new()
 var _app_dropdown_btn := Button.new()
+var _deploy_btn := Button.new()
+var _stop_deploy_btn := Button.new()
+var _deploy_app_dropdown_btn := Button.new()
+var _deploy_version_dropdown_btn := Button.new()
 
 var _image_name_field
 var _image_tag_field
@@ -53,16 +59,22 @@ var _local_tag_option := OptionButton.new()
 var _app_name_edit := LineEdit.new()
 var _upload_image_option := OptionButton.new()
 var _app_names_popup := PopupMenu.new()
+var _deploy_app_name_edit := LineEdit.new()
+var _deploy_version_edit := LineEdit.new()
+var _deploy_app_names_popup := PopupMenu.new()
+var _deploy_versions_popup := PopupMenu.new()
 
 var _http := HTTPRequest.new()
 var _templates_http := HTTPRequest.new()
 var _app_http := HTTPRequest.new()
+var _deploy_http := HTTPRequest.new()
 var _auth
 var _templates
 var _presets
 var _exporter
 var _docker
 var _app_api
+var _deploy_api
 
 var _awaiting_token_entry := false
 var _templates_downloading := false
@@ -76,11 +88,20 @@ var _push_progress := 0.0
 var _uploading := false
 var _upload_remote_ref := ""
 var _stored_app_names: PackedStringArray = []
+var _stored_app_versions: PackedStringArray = []
 var _pending_app_dropdown_open := false
+var _pending_deploy_app_dropdown_open := false
+var _pending_deploy_version_dropdown_open := false
 var _token_debounce: Timer
 var _token_validating := false
 var _token_validate_again := false
 var _suppress_token_changed := false
+
+enum DeployPhase { IDLE, IP, CREATE, POLL_READY, LIST_STOP, STOP, POLL_STOP }
+var _deploy_phase: DeployPhase = DeployPhase.IDLE
+var _deploy_request_id := ""
+var _deploy_poll_timer: Timer
+var _deploy_elapsed := 0.0
 
 const TOKEN_VALIDATE_DEBOUNCE_SEC := 0.75
 const APP_NAME_ALLOWED := "^[a-zA-Z0-9_+\\-.]*$"
@@ -92,6 +113,7 @@ func _ready() -> void:
 	_exporter = ExportScript.new()
 	_docker = DockerScript.new()
 	_app_api = AppApiScript.new()
+	_deploy_api = DeploymentsApiScript.new()
 
 	SettingsScript.ensure_defaults()
 	set_anchors_and_offsets_preset(PRESET_FULL_RECT)
@@ -120,6 +142,21 @@ func _ready() -> void:
 	add_child(_app_http)
 	_app_api.bind_http(_app_http)
 	_app_api.get_apps_completed.connect(_on_get_apps_completed)
+	_app_api.get_versions_completed.connect(_on_get_versions_completed)
+
+	add_child(_deploy_http)
+	_deploy_api.bind_http(_deploy_http)
+	_deploy_api.ip_completed.connect(_on_deploy_ip_completed)
+	_deploy_api.create_completed.connect(_on_deploy_create_completed)
+	_deploy_api.status_completed.connect(_on_deploy_status_completed)
+	_deploy_api.list_completed.connect(_on_deploy_list_completed)
+	_deploy_api.stop_completed.connect(_on_deploy_stop_completed)
+
+	_deploy_poll_timer = Timer.new()
+	_deploy_poll_timer.one_shot = true
+	_deploy_poll_timer.wait_time = ConstantsScript.DEPLOY_POLL_SECONDS
+	_deploy_poll_timer.timeout.connect(_on_deploy_poll_timeout)
+	add_child(_deploy_poll_timer)
 
 	_build_header()
 	_build_discord_row()
@@ -240,7 +277,8 @@ func _section_header_text(title: String, expanded: bool) -> String:
 func _clear_action_statuses() -> void:
 	for status in [
 		_auth_status, _templates_status, _export_status, _docker_status,
-		_containerize_status, _rebuild_status, _local_status, _upload_status
+		_containerize_status, _rebuild_status, _local_status, _upload_status,
+		_deploy_status
 	]:
 		if status:
 			status.clear_all()
@@ -463,7 +501,7 @@ func _build_workflow() -> void:
 	_app_dropdown_btn.tooltip_text = "Choose an existing Edgegap application"
 	_app_dropdown_btn.pressed.connect(_on_app_name_dropdown_pressed)
 	_app_names_popup.id_pressed.connect(_on_app_name_popup_id)
-	_app_dropdown_btn.add_child(_app_names_popup)
+	add_child(_app_names_popup)
 	app_name_row.add_child(_app_name_edit)
 	app_name_row.add_child(_app_dropdown_btn)
 	upload_body.add_child(_labeled("Application name", app_name_row))
@@ -493,6 +531,70 @@ func _build_workflow() -> void:
 	))
 
 	_workflow_box.add_child(upload_section.root)
+
+	var deploy_section: Dictionary = _make_collapsible_section("6. Deploy a Server on Edgegap", true)
+	var deploy_body: VBoxContainer = deploy_section.body
+
+	var deploy_app_row := HBoxContainer.new()
+	deploy_app_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	deploy_app_row.add_theme_constant_override("separation", 6)
+	_deploy_app_name_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_deploy_app_name_edit.placeholder_text = "Application name"
+	_deploy_app_name_edit.text_changed.connect(_on_deploy_app_name_changed)
+	_deploy_app_dropdown_btn.custom_minimum_size = Vector2(28, 0)
+	_set_button_icon(_deploy_app_dropdown_btn, ["GuiTreeArrowDown", "ArrowDown"])
+	_deploy_app_dropdown_btn.tooltip_text = "Choose an existing Edgegap application"
+	_deploy_app_dropdown_btn.pressed.connect(_on_deploy_app_dropdown_pressed)
+	_deploy_app_names_popup.id_pressed.connect(_on_deploy_app_popup_id)
+	add_child(_deploy_app_names_popup)
+	deploy_app_row.add_child(_deploy_app_name_edit)
+	deploy_app_row.add_child(_deploy_app_dropdown_btn)
+	deploy_body.add_child(_labeled("Application name", deploy_app_row))
+
+	var deploy_version_row := HBoxContainer.new()
+	deploy_version_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	deploy_version_row.add_theme_constant_override("separation", 6)
+	_deploy_version_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_deploy_version_edit.placeholder_text = "Application version"
+	_deploy_version_edit.text_changed.connect(func(_t: String): _update_deploy_buttons_enabled())
+	_deploy_version_dropdown_btn.custom_minimum_size = Vector2(28, 0)
+	_set_button_icon(_deploy_version_dropdown_btn, ["GuiTreeArrowDown", "ArrowDown"])
+	_deploy_version_dropdown_btn.tooltip_text = "Choose an active application version"
+	_deploy_version_dropdown_btn.pressed.connect(_on_deploy_version_dropdown_pressed)
+	_deploy_versions_popup.id_pressed.connect(_on_deploy_version_popup_id)
+	add_child(_deploy_versions_popup)
+	deploy_version_row.add_child(_deploy_version_edit)
+	deploy_version_row.add_child(_deploy_version_dropdown_btn)
+	deploy_body.add_child(_labeled("Application version", deploy_version_row))
+
+	var free_tier_link := Button.new()
+	free_tier_link.text = "You're limited to 1 deployment and 60 minutes of runtime per instance in Free Tier."
+	free_tier_link.flat = true
+	free_tier_link.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	free_tier_link.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_set_button_icon(free_tier_link, ["ExternalLink", "Help"])
+	free_tier_link.pressed.connect(func(): _open_edgegap_url(ConstantsScript.FREE_TIER_INFO_URL))
+	deploy_body.add_child(free_tier_link)
+
+	_deploy_btn.text = "Deploy to cloud"
+	_style_primary(_deploy_btn)
+	_set_button_icon(_deploy_btn, ["Play", "Forward", "ArrowRight"])
+	_deploy_btn.pressed.connect(_on_deploy_to_cloud)
+
+	_stop_deploy_btn.text = "Stop last deployment"
+	_style_secondary(_stop_deploy_btn)
+	_set_button_icon(_stop_deploy_btn, ["Stop", "Remove", "Close"])
+	_stop_deploy_btn.pressed.connect(_on_stop_last_deployment)
+
+	_deploy_status = _new_action_status()
+	deploy_body.add_child(_action_block(
+		_button_row([_stop_deploy_btn], [_deploy_btn]),
+		_deploy_status,
+		_deploy_btn
+	))
+
+	_workflow_box.add_child(deploy_section.root)
+	_update_deploy_buttons_enabled()
 
 	_root.add_child(_workflow_box)
 	_reload_field_defaults()
@@ -548,6 +650,10 @@ func _on_sign_in_pressed() -> void:
 func _on_sign_out() -> void:
 	if _token_debounce:
 		_token_debounce.stop()
+	if _deploy_poll_timer:
+		_deploy_poll_timer.stop()
+	_deploy_phase = DeployPhase.IDLE
+	_deploy_request_id = ""
 	SettingsScript.clear_token()
 	_set_token_edit_text("")
 	_awaiting_token_entry = false
@@ -892,6 +998,11 @@ func _set_pipeline_buttons_disabled(disabled: bool) -> void:
 	_containerize_btn.disabled = disabled
 	_rebuild_btn.disabled = disabled
 	_upload_btn.disabled = disabled
+	if disabled:
+		_deploy_btn.disabled = true
+		_stop_deploy_btn.disabled = true
+	else:
+		_update_deploy_buttons_enabled()
 
 func _on_deploy_local() -> void:
 	_local_status.bind(_deploy_local_btn)
@@ -938,46 +1049,113 @@ func _on_terminate_local() -> void:
 		_local_status.set_error("No plugin container to terminate.")
 
 func _refresh_local_images() -> void:
-	var previous_local := _selected_image_ref(_local_tag_option)
-	var previous_upload := _selected_image_ref(_upload_image_option)
+	var previous_local := _short_image_ref(_selected_image_ref(_local_tag_option))
+	var previous_upload := _short_image_ref(_selected_image_ref(_upload_image_option))
 
 	var preferred := previous_local
 	var field_name: String = _image_name_field.get_value().strip_edges() if _image_name_field else ""
 	var field_tag: String = _image_tag_field.get_value().strip_edges() if _image_tag_field else ""
 	if not field_name.is_empty() and not field_tag.is_empty():
-		preferred = "%s:%s" % [field_name, field_tag]
+		preferred = "%s:%s" % [field_name.get_file() if "/" in field_name else field_name, field_tag]
 
 	var docker_status = _docker.check_status()
 	if docker_status != DockerScript.Status.OK:
 		var placeholder := _docker_unavailable_placeholder(docker_status)
-		_fill_image_option(_local_tag_option, PackedStringArray([placeholder]), "")
-		_fill_image_option(_upload_image_option, PackedStringArray([placeholder]), "")
+		_fill_image_option(_local_tag_option, [{"display": placeholder, "uploaded": false, "local_ref": ""}], "")
+		_fill_image_option(_upload_image_option, [{"display": placeholder, "uploaded": false, "local_ref": ""}], "")
 		return
 
 	var refs: PackedStringArray = _docker.list_local_image_refs()
-	if not preferred.is_empty() and refs.find(preferred) < 0:
-		refs.insert(0, preferred)
-
-	if refs.is_empty():
-		refs.append("No local images — containerize your server first")
+	var entries: Array = _dedupe_image_refs(refs)
+	if entries.is_empty() and not preferred.is_empty():
+		entries.append({"display": preferred, "uploaded": false, "local_ref": preferred})
+	if entries.is_empty():
+		entries.append({
+			"display": "No local images — containerize your server first",
+			"uploaded": false,
+			"local_ref": "",
+		})
 
 	var local_preferred := preferred if not preferred.is_empty() else previous_local
 	var upload_preferred := previous_upload if not previous_upload.is_empty() else preferred
-	_fill_image_option(_local_tag_option, refs, local_preferred)
-	_fill_image_option(_upload_image_option, refs, upload_preferred)
+	_fill_image_option(_local_tag_option, entries, local_preferred)
+	_fill_image_option(_upload_image_option, entries, upload_preferred)
 	_maybe_prefill_app_name_from_selected_upload_image()
 
-func _fill_image_option(option: OptionButton, refs: PackedStringArray, preferred: String) -> void:
+## Collapse registry/project duplicates into one "name:tag" row; mark uploaded when a remote tag exists.
+func _dedupe_image_refs(refs: PackedStringArray) -> Array:
+	var by_key := {}
+	var order: PackedStringArray = []
+	for ref in refs:
+		var text := str(ref).strip_edges()
+		if text.is_empty() or _is_docker_unavailable_placeholder(text):
+			continue
+		var parts := text.rsplit(":", true, 1)
+		if parts.size() != 2:
+			continue
+		var repo := parts[0]
+		var tag := parts[1]
+		var short_name := repo.get_file() if "/" in repo else repo
+		var key := "%s:%s" % [short_name, tag]
+		var is_remote := "/" in repo
+		if not by_key.has(key):
+			by_key[key] = {"display": key, "uploaded": is_remote, "local_ref": text}
+			order.append(key)
+			continue
+		var entry: Dictionary = by_key[key]
+		if is_remote:
+			entry.uploaded = true
+		else:
+			# Prefer bare local ref for docker run / tag source.
+			entry.local_ref = text
+		by_key[key] = entry
+
+	var entries: Array = []
+	for key in order:
+		entries.append(by_key[key])
+	return entries
+
+func _fill_image_option(option: OptionButton, entries: Array, preferred: String) -> void:
 	option.get_popup().clear()
 	option.clear()
-	for ref in refs:
-		option.add_item(ref)
+	var cloud_icon := _get_uploaded_image_icon()
+	var preferred_short := _short_image_ref(preferred)
+	for entry_variant in entries:
+		var entry: Dictionary = entry_variant
+		var display := str(entry.get("display", ""))
+		var uploaded := bool(entry.get("uploaded", false))
+		var local_ref := str(entry.get("local_ref", display))
+		var idx := option.item_count
+		if uploaded and cloud_icon != null:
+			option.add_icon_item(cloud_icon, display)
+		else:
+			option.add_item(display)
+		option.set_item_metadata(idx, {
+			"local_ref": local_ref,
+			"uploaded": uploaded,
+			"display": display,
+		})
 	if option.item_count == 0:
 		return
-	if preferred.is_empty() or _is_docker_unavailable_placeholder(preferred):
+	if preferred_short.is_empty() or _is_docker_unavailable_placeholder(preferred_short):
 		option.select(0)
 	else:
-		option.select(_find_image_ref_index(option, preferred))
+		option.select(_find_image_ref_index(option, preferred_short))
+
+func _get_uploaded_image_icon() -> Texture2D:
+	# Godot EditorIcons has no cloud glyph; use a bundled SVG.
+	var path := PathsScript.addon_root().path_join("assets/cloud.svg")
+	var tex := load(path) as Texture2D
+	if tex != null:
+		return tex
+	return _get_editor_icon(["ExternalLink", "ArrowUp"])
+
+func _get_editor_icon(icon_names: Array) -> Texture2D:
+	var theme := EditorInterface.get_editor_theme()
+	for icon_name in icon_names:
+		if theme.has_icon(icon_name, "EditorIcons"):
+			return theme.get_icon(icon_name, "EditorIcons")
+	return null
 
 func _selected_image_ref(option: OptionButton) -> String:
 	if option.item_count <= 0 or option.selected < 0:
@@ -985,7 +1163,20 @@ func _selected_image_ref(option: OptionButton) -> String:
 	var text := option.get_item_text(option.selected)
 	if _is_docker_unavailable_placeholder(text):
 		return ""
+	var meta: Variant = option.get_item_metadata(option.selected)
+	if typeof(meta) == TYPE_DICTIONARY:
+		var local_ref := str(meta.get("local_ref", ""))
+		if not local_ref.is_empty():
+			return local_ref
 	return text
+
+func _short_image_ref(ref: String) -> String:
+	if ref.is_empty() or _is_docker_unavailable_placeholder(ref):
+		return ""
+	var parsed := _parse_image_ref(ref)
+	if parsed.size() != 2:
+		return ref
+	return "%s:%s" % [parsed[0], parsed[1]]
 
 func _docker_unavailable_placeholder(status) -> String:
 	match status:
@@ -1000,10 +1191,11 @@ func _is_docker_unavailable_placeholder(text: String) -> bool:
 	return text.begins_with("Docker is not") or text.begins_with("No local images")
 
 func _find_image_ref_index(option: OptionButton, ref: String) -> int:
+	var want := _short_image_ref(ref)
 	for i in option.item_count:
-		if option.get_item_text(i) == ref:
+		if _short_image_ref(option.get_item_text(i)) == want:
 			return i
-	option.add_item(ref)
+	option.add_item(want if not want.is_empty() else ref)
 	return option.item_count - 1
 
 func _tokenize(value: String) -> String:
@@ -1089,24 +1281,53 @@ func _on_app_name_dropdown_pressed() -> void:
 			_upload_status.set_error("Failed to load applications. See Output.")
 
 func _on_get_apps_completed(ok: bool, response_code: int, app_names: PackedStringArray, _body: String) -> void:
+	var wanted_upload := _pending_app_dropdown_open
+	var wanted_deploy := _pending_deploy_app_dropdown_open
+	_pending_app_dropdown_open = false
+	_pending_deploy_app_dropdown_open = false
+
 	if not ok:
-		_pending_app_dropdown_open = false
-		if _upload_status and not _uploading:
+		if wanted_upload and _upload_status and not _uploading:
 			_upload_status.bind(_upload_btn)
 			_upload_status.set_error("Failed to list apps (HTTP %d)." % response_code)
+		if wanted_deploy and _deploy_status and _deploy_phase == DeployPhase.IDLE:
+			_deploy_status.bind(_deploy_btn)
+			_deploy_status.set_error("Failed to list apps (HTTP %d)." % response_code)
 		return
+
 	_stored_app_names = app_names
-	_app_names_popup.clear()
-	_app_names_popup.add_item(ConstantsScript.DEFAULT_NEW_APPLICATION_LABEL, 0)
-	var id := 1
-	for app_name in _stored_app_names:
-		_app_names_popup.add_item(app_name, id)
-		id += 1
-	if _pending_app_dropdown_open:
-		_pending_app_dropdown_open = false
-		var rect := _app_dropdown_btn.get_global_rect()
-		_app_names_popup.position = Vector2i(int(rect.position.x), int(rect.end.y))
-		_app_names_popup.popup()
+
+	if wanted_upload:
+		_app_names_popup.clear()
+		_app_names_popup.add_item(ConstantsScript.DEFAULT_NEW_APPLICATION_LABEL, 0)
+		var id := 1
+		for app_name in _stored_app_names:
+			_app_names_popup.add_item(app_name, id)
+			id += 1
+		_show_dropdown_popup(_app_names_popup, _app_dropdown_btn)
+
+	if wanted_deploy:
+		_deploy_app_names_popup.clear()
+		var id := 0
+		for app_name in _stored_app_names:
+			_deploy_app_names_popup.add_item(app_name, id)
+			id += 1
+		if _deploy_app_names_popup.item_count == 0:
+			if _deploy_status:
+				_deploy_status.bind(_deploy_btn)
+				_deploy_status.set_error("No applications found. Upload an image first.")
+			return
+		_show_dropdown_popup(_deploy_app_names_popup, _deploy_app_dropdown_btn)
+
+func _show_dropdown_popup(popup: PopupMenu, anchor: Control) -> void:
+	# Without max_size, PopupMenu height is clamped to the parent rect (the dock),
+	# which often fits only ~10 items and hides the rest with no usable scroll.
+	popup.reset_size()
+	var anchor_rect := anchor.get_global_rect()
+	var width := maxi(int(anchor_rect.size.x), 220)
+	popup.max_size = Vector2i(maxi(width, 360), 420)
+	var pos := Vector2i(int(anchor_rect.position.x), int(anchor_rect.end.y))
+	popup.popup(Rect2i(pos, Vector2i(width, 0)))
 
 func _on_app_name_popup_id(id: int) -> void:
 	var label := _app_names_popup.get_item_text(_app_names_popup.get_item_index(id))
@@ -1254,7 +1475,314 @@ func _finish_upload_open_create_version() -> void:
 	_open_edgegap_url(url)
 	_uploading = false
 	_set_pipeline_buttons_disabled(false)
+	_refresh_local_images()
 	_upload_status.set_success("Image pushed. Finish creating the app version in the browser.")
+	if not app_name.is_empty():
+		_deploy_app_name_edit.text = app_name
+		_deploy_version_edit.text = ""
+		_update_deploy_buttons_enabled()
+		_load_deploy_app_versions(false)
+
+func _update_deploy_buttons_enabled() -> void:
+	var busy := _deploy_phase != DeployPhase.IDLE or _exporting or _containerizing or _rebuilding or _uploading
+	var can_deploy := (
+		not busy
+		and not _deploy_app_name_edit.text.strip_edges().is_empty()
+		and not _deploy_version_edit.text.strip_edges().is_empty()
+	)
+	_deploy_btn.disabled = not can_deploy
+	_stop_deploy_btn.disabled = busy
+	_deploy_app_dropdown_btn.disabled = busy
+	_deploy_version_dropdown_btn.disabled = busy or _deploy_app_name_edit.text.strip_edges().is_empty()
+
+func _on_deploy_app_name_changed(_text: String) -> void:
+	_deploy_version_edit.text = ""
+	_stored_app_versions = PackedStringArray()
+	_update_deploy_buttons_enabled()
+
+func _on_deploy_app_dropdown_pressed() -> void:
+	_pending_deploy_app_dropdown_open = true
+	_pending_app_dropdown_open = false
+	_app_api.set_authorization(SettingsScript.get_token())
+	var err: Error = _app_api.get_apps()
+	if err != OK:
+		_pending_deploy_app_dropdown_open = false
+		if _deploy_status:
+			_deploy_status.bind(_deploy_btn)
+			_deploy_status.set_error("Failed to load applications. See Output.")
+
+func _on_deploy_app_popup_id(id: int) -> void:
+	var label := _deploy_app_names_popup.get_item_text(_deploy_app_names_popup.get_item_index(id))
+	_deploy_app_name_edit.text = label
+	_deploy_version_edit.text = ""
+	_update_deploy_buttons_enabled()
+	_load_deploy_app_versions(false)
+
+func _on_deploy_version_dropdown_pressed() -> void:
+	var app_name := _deploy_app_name_edit.text.strip_edges()
+	if app_name.is_empty():
+		if _deploy_status:
+			_deploy_status.bind(_deploy_btn)
+			_deploy_status.set_error("Select an application first.")
+		return
+	_load_deploy_app_versions(true)
+
+func _load_deploy_app_versions(open_popup: bool) -> void:
+	_pending_deploy_version_dropdown_open = open_popup
+	_app_api.set_authorization(SettingsScript.get_token())
+	var err: Error = _app_api.get_app_versions(_deploy_app_name_edit.text.strip_edges())
+	if err != OK:
+		_pending_deploy_version_dropdown_open = false
+		if _deploy_status:
+			_deploy_status.bind(_deploy_btn)
+			_deploy_status.set_error("Failed to load app versions. See Output.")
+
+func _on_get_versions_completed(ok: bool, response_code: int, versions: PackedStringArray, _body: String) -> void:
+	var open_popup := _pending_deploy_version_dropdown_open
+	_pending_deploy_version_dropdown_open = false
+	if not ok:
+		if open_popup and _deploy_status and _deploy_phase == DeployPhase.IDLE:
+			_deploy_status.bind(_deploy_btn)
+			_deploy_status.set_error("Failed to list app versions (HTTP %d)." % response_code)
+		return
+	_stored_app_versions = versions
+	_deploy_versions_popup.clear()
+	var id := 0
+	for version in _stored_app_versions:
+		_deploy_versions_popup.add_item(version, id)
+		id += 1
+	if _deploy_versions_popup.item_count == 0:
+		if open_popup and _deploy_status and _deploy_phase == DeployPhase.IDLE:
+			_deploy_status.bind(_deploy_btn)
+			_deploy_status.set_error("No active versions for this application.")
+		_update_deploy_buttons_enabled()
+		return
+	if _deploy_version_edit.text.strip_edges().is_empty():
+		_deploy_version_edit.text = _stored_app_versions[0]
+	_update_deploy_buttons_enabled()
+	if open_popup:
+		_show_dropdown_popup(_deploy_versions_popup, _deploy_version_dropdown_btn)
+
+func _on_deploy_version_popup_id(id: int) -> void:
+	_deploy_version_edit.text = _deploy_versions_popup.get_item_text(_deploy_versions_popup.get_item_index(id))
+	_update_deploy_buttons_enabled()
+
+func _on_deploy_to_cloud() -> void:
+	if _deploy_phase != DeployPhase.IDLE or _exporting or _containerizing or _rebuilding or _uploading:
+		return
+	var app_name := _deploy_app_name_edit.text.strip_edges()
+	var version := _deploy_version_edit.text.strip_edges()
+	if app_name.is_empty() or version.is_empty():
+		_deploy_status.bind(_deploy_btn)
+		_deploy_status.set_error("Application name and version are required.")
+		return
+	if not SettingsScript.is_token_verified():
+		_deploy_status.bind(_deploy_btn)
+		_deploy_status.set_error("Validate your Edgegap token first.")
+		return
+
+	_deploy_status.bind(_deploy_btn)
+	_deploy_api.set_authorization(SettingsScript.get_token())
+	_deploy_elapsed = 0.0
+	_deploy_request_id = ""
+
+	_deploy_phase = DeployPhase.IP
+	_update_deploy_buttons_enabled()
+	_deploy_status.set_busy("Requesting Deploy…", 10)
+	var err: Error = _deploy_api.get_public_ip()
+	if err != OK:
+		_finish_deploy_error("Failed to look up public IP. See Output.")
+
+func _start_create_deployment(external_ip: String) -> void:
+	_deploy_phase = DeployPhase.CREATE
+	_update_deploy_buttons_enabled()
+	_deploy_status.bind(_deploy_btn)
+	_deploy_status.set_busy("Requesting Deploy…", 25)
+	var err: Error = _deploy_api.create_deployment(
+		_deploy_app_name_edit.text.strip_edges(),
+		_deploy_version_edit.text.strip_edges(),
+		external_ip
+	)
+	if err != OK:
+		_finish_deploy_error("Failed to create deployment. See Output.")
+
+func _on_deploy_ip_completed(ok: bool, public_ip: String, _response_code: int, _body: String) -> void:
+	if _deploy_phase != DeployPhase.IP:
+		return
+	if not ok or public_ip.is_empty():
+		_finish_deploy_error("Couldn't retrieve your public IP.")
+		return
+	_start_create_deployment(public_ip)
+
+func _on_deploy_create_completed(ok: bool, request_id: String, _response_code: int, body: String) -> void:
+	if _deploy_phase != DeployPhase.CREATE:
+		return
+	if not ok or request_id.is_empty():
+		_finish_deploy_error(_extract_api_error(body, "Failed to create deployment."))
+		return
+	_deploy_request_id = request_id
+	SettingsScript.set_last_deployment_id(request_id)
+	_deploy_status.set_busy("Deployment starting, see Dashboard for details.", 40)
+	_open_edgegap_url(ConstantsScript.DEPLOY_APP_URL)
+	_deploy_phase = DeployPhase.POLL_READY
+	_deploy_elapsed = 0.0
+	_schedule_deploy_poll()
+
+func _schedule_deploy_poll() -> void:
+	if _deploy_poll_timer:
+		_deploy_poll_timer.start(ConstantsScript.DEPLOY_POLL_SECONDS)
+
+func _on_deploy_poll_timeout() -> void:
+	_deploy_elapsed += ConstantsScript.DEPLOY_POLL_SECONDS
+	if _deploy_elapsed > ConstantsScript.DEPLOY_TIMEOUT_SECONDS:
+		if _deploy_phase == DeployPhase.POLL_READY:
+			_finish_deploy_error("Timed out waiting for deployment to become ready.")
+		elif _deploy_phase == DeployPhase.POLL_STOP:
+			_finish_deploy_error("Timed out waiting for deployment to stop.")
+		return
+
+	match _deploy_phase:
+		DeployPhase.POLL_READY:
+			_deploy_status.set_busy("Waiting for deployment READY…", minf(40.0 + _deploy_elapsed, 90.0))
+			var err: Error = _deploy_api.get_deployment_status(_deploy_request_id)
+			if err != OK:
+				_finish_deploy_error("Failed to poll deployment status. See Output.")
+		DeployPhase.POLL_STOP:
+			_deploy_status.bind(_stop_deploy_btn)
+			_deploy_status.set_busy("Stopping…", minf(40.0 + _deploy_elapsed, 90.0))
+			var err: Error = _deploy_api.stop_deployment(_deploy_request_id)
+			if err != OK:
+				_finish_deploy_error("Failed to poll stop status. See Output.")
+		_:
+			pass
+
+func _on_deploy_status_completed(ok: bool, status: Dictionary, _response_code: int, body: String) -> void:
+	if _deploy_phase != DeployPhase.POLL_READY:
+		return
+	if not ok:
+		_finish_deploy_error(_extract_api_error(body, "Failed to get deployment status."))
+		return
+	var current := str(status.get("current_status", ""))
+	if current == ConstantsScript.READY_STATUS:
+		_deploy_phase = DeployPhase.IDLE
+		_update_deploy_buttons_enabled()
+		_deploy_status.bind(_deploy_btn)
+		_deploy_status.set_success(
+			"Server deployed successfully. Don't forget to remove the deployment after testing."
+		)
+		return
+	if bool(status.get("error", false)):
+		_finish_deploy_error(str(status.get("error_detail", "Deployment failed.")))
+		return
+	_schedule_deploy_poll()
+
+func _on_stop_last_deployment() -> void:
+	if _deploy_phase != DeployPhase.IDLE or _exporting or _containerizing or _rebuilding or _uploading:
+		return
+	if not SettingsScript.is_token_verified():
+		_deploy_status.bind(_stop_deploy_btn)
+		_deploy_status.set_error("Validate your Edgegap token first.")
+		return
+
+	_deploy_status.bind(_stop_deploy_btn)
+	_deploy_api.set_authorization(SettingsScript.get_token())
+	_deploy_phase = DeployPhase.LIST_STOP
+	_deploy_elapsed = 0.0
+	_update_deploy_buttons_enabled()
+	_deploy_status.set_busy("Looking up quickstart deployments…", 15)
+	var err: Error = _deploy_api.list_deployments()
+	if err != OK:
+		_finish_deploy_error("Failed to list deployments. See Output.")
+
+func _on_deploy_list_completed(ok: bool, deployments: Array, _response_code: int, body: String) -> void:
+	if _deploy_phase != DeployPhase.LIST_STOP:
+		return
+	if not ok:
+		_finish_deploy_error(_extract_api_error(body, "Failed to list deployments."))
+		return
+
+	var quickstart_ids: PackedStringArray = []
+	for deploy in deployments:
+		if typeof(deploy) != TYPE_DICTIONARY:
+			continue
+		if not _deployment_has_quickstart_tag(deploy):
+			continue
+		var request_id := str(deploy.get("request_id", "")).strip_edges()
+		if not request_id.is_empty():
+			quickstart_ids.append(request_id)
+
+	if quickstart_ids.is_empty():
+		_deploy_phase = DeployPhase.IDLE
+		_update_deploy_buttons_enabled()
+		_deploy_status.bind(_stop_deploy_btn)
+		_deploy_status.set_success("No quickstart deployment found")
+		return
+
+	_deploy_request_id = quickstart_ids[0]
+	_deploy_phase = DeployPhase.STOP
+	_deploy_status.set_busy("Stopping…", 30)
+	var err: Error = _deploy_api.stop_deployment(_deploy_request_id)
+	if err != OK:
+		_finish_deploy_error("Failed to stop deployment. See Output.")
+
+func _on_deploy_stop_completed(ok: bool, response_code: int, body: String) -> void:
+	if _deploy_phase == DeployPhase.STOP:
+		if not ok or response_code != 200:
+			_finish_deploy_error(_extract_api_error(body, "Failed to stop deployment."))
+			return
+		_deploy_phase = DeployPhase.POLL_STOP
+		_deploy_elapsed = 0.0
+		_schedule_deploy_poll()
+		return
+
+	if _deploy_phase == DeployPhase.POLL_STOP:
+		if response_code == 410:
+			SettingsScript.clear_last_deployment_id()
+			_deploy_phase = DeployPhase.IDLE
+			_update_deploy_buttons_enabled()
+			_deploy_status.bind(_stop_deploy_btn)
+			_deploy_status.set_success("Deployment stopped successfully")
+			return
+		if response_code == 200:
+			_schedule_deploy_poll()
+			return
+		_finish_deploy_error(_extract_api_error(body, "Failed while waiting for deployment stop."))
+
+func _deployment_has_quickstart_tag(deploy: Dictionary) -> bool:
+	var tags: Variant = deploy.get("tags", [])
+	if typeof(tags) != TYPE_ARRAY:
+		return false
+	for tag in tags:
+		if str(tag) == ConstantsScript.DEFAULT_DEPLOYMENT_TAG:
+			return true
+	return false
+
+func _finish_deploy_error(message: String) -> void:
+	_deploy_poll_timer.stop()
+	var was_stop := (
+		_deploy_phase == DeployPhase.LIST_STOP
+		or _deploy_phase == DeployPhase.STOP
+		or _deploy_phase == DeployPhase.POLL_STOP
+	)
+	_deploy_phase = DeployPhase.IDLE
+	_update_deploy_buttons_enabled()
+	if _deploy_status:
+		_deploy_status.bind(_stop_deploy_btn if was_stop else _deploy_btn)
+		_deploy_status.set_error(message)
+	LoggerScript.error(message)
+	LoggerScript.info("See deployments on Dashboard: %s" % ConstantsScript.DEPLOY_APP_URL)
+
+func _extract_api_error(body: String, fallback: String) -> String:
+	if body.is_empty():
+		return fallback
+	var parsed: Variant = JSON.parse_string(body)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return fallback
+	for key in ["message", "error", "error_message", "detail"]:
+		var value := str(parsed.get(key, "")).strip_edges()
+		if not value.is_empty():
+			return value
+	return fallback
 
 func _on_http_completed(_result: int, _response_code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
 	# Wizard/auth owns auth HTTP responses via EdgegapWizardApi.
