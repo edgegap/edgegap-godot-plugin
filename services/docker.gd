@@ -51,6 +51,7 @@ func open_install_page() -> void:
 var _build_pid: int = -1
 var _build_image_name := ""
 var _build_image_tag := ""
+var _build_log_path := ""
 
 func is_build_running() -> bool:
 	return _build_pid >= 0 and OS.is_process_running(_build_pid)
@@ -73,17 +74,22 @@ func start_build_image(
 		return ERR_BUSY
 
 	var project_root := ProjectSettings.globalize_path("res://")
-	var args := PackedStringArray()
+	var binary_path := project_root.path_join("%s.x86_64" % server_build_path)
+	var pck_path := project_root.path_join("%s.pck" % server_build_path)
+	if not FileAccess.file_exists(binary_path):
+		EdgegapLogger.error("Server binary missing before Docker build: %s" % binary_path)
+		return ERR_FILE_NOT_FOUND
+	if not FileAccess.file_exists(pck_path):
+		EdgegapLogger.error(
+			"Server .pck missing before Docker build: %s. In the Edgegap export preset, disable binary_format/embed_pck, then re-export." % pck_path
+		)
+		return ERR_FILE_NOT_FOUND
 
-	# Match Edgegap Unity: ARM hosts cross-compile with buildx for amd64 Edgegap infra.
-	# --load puts the image in the local Docker store (buildx otherwise only caches it).
-	# Platform comes from optional build params (defaulted on ARM) — do not add it twice.
-	if is_arm_cpu():
-		args.append_array(PackedStringArray(["buildx", "build", "--load"]))
-		if not _has_platform_flag(build_params):
-			args.append_array(PackedStringArray(["--platform", "linux/amd64"]))
-	else:
-		args.append("build")
+	var args := PackedStringArray(["build"])
+	# Docker Desktop on Apple Silicon: plain `docker build --platform` cross-builds and
+	# loads locally. Avoid `buildx --load`, which often fails with the default docker driver.
+	if is_arm_cpu() and not _has_platform_flag(build_params):
+		args.append_array(PackedStringArray(["--platform", "linux/amd64"]))
 
 	for part in build_params.split(" ", false):
 		if not part.is_empty():
@@ -98,12 +104,15 @@ func start_build_image(
 
 	_build_image_name = image_name
 	_build_image_tag = image_tag
+	_build_log_path = _docker_log_path("docker-build.log")
 
 	var command_and_args := _docker_command(args)
 	var command: String = command_and_args[0]
 	var cmd_args: PackedStringArray = command_and_args[1]
 	EdgegapLogger.info("Docker build starting: %s %s" % [command, " ".join(cmd_args)])
-	_build_pid = OS.create_process(command, cmd_args, false)
+	EdgegapLogger.info("Docker build log: %s" % _build_log_path)
+
+	_build_pid = _create_process_with_log(command, cmd_args, _build_log_path)
 	if _build_pid < 0:
 		EdgegapLogger.error("Failed to start Docker build process.")
 		_build_pid = -1
@@ -125,6 +134,7 @@ func take_build_exit_code() -> int:
 	_build_pid = -1
 	if code != 0:
 		EdgegapLogger.error("Docker build failed with exit code %d" % code)
+		_dump_log_tail(_build_log_path)
 	else:
 		EdgegapLogger.info("Docker image built: %s:%s" % [_build_image_name, _build_image_tag])
 	return code
@@ -136,6 +146,42 @@ static func _normalize_exit_code(code: int) -> int:
 	if code > 255:
 		return (code >> 8) & 0xff
 	return code
+
+func _docker_log_path(filename: String) -> String:
+	var cache_dir := OS.get_cache_dir().path_join("edgegap-godot")
+	DirAccess.make_dir_recursive_absolute(cache_dir)
+	return cache_dir.path_join(filename)
+
+func _create_process_with_log(command: String, args: PackedStringArray, log_path: String) -> int:
+	var parts: PackedStringArray = [_shell_quote(command)]
+	for arg in args:
+		parts.append(_shell_quote(str(arg)))
+	var redirected := "%s > %s 2>&1" % [" ".join(parts), _shell_quote(log_path)]
+	if OS.get_name() == "Windows":
+		return OS.create_process("cmd.exe", PackedStringArray(["/C", redirected]), false)
+	return OS.create_process("/bin/bash", PackedStringArray(["-c", redirected]), false)
+
+func _dump_log_tail(log_path: String, max_lines: int = 50) -> void:
+	if log_path.is_empty() or not FileAccess.file_exists(log_path):
+		EdgegapLogger.error("Docker log file missing; cannot show build output.")
+		return
+	var file := FileAccess.open(log_path, FileAccess.READ)
+	if file == null:
+		EdgegapLogger.error("Could not read Docker log: %s" % log_path)
+		return
+	var text := file.get_as_text()
+	file.close()
+	var lines := text.replace("\r", "").split("\n", false)
+	var start := maxi(0, lines.size() - max_lines)
+	EdgegapLogger.error("—— Docker output (last %d lines) ——" % mini(max_lines, lines.size()))
+	for i in range(start, lines.size()):
+		EdgegapLogger.error(lines[i])
+	EdgegapLogger.error("—— end Docker output ——")
+
+func _shell_quote(value: String) -> String:
+	if OS.get_name() == "Windows":
+		return "\"%s\"" % value.replace("\"", "\\\"")
+	return "'%s'" % value.replace("'", "'\"'\"'")
 
 func run_container(image_name: String, image_tag: String, run_params: String) -> String:
 	if is_plugin_container_running():
