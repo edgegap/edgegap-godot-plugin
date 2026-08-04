@@ -158,11 +158,14 @@ func _create_process_with_log(command: String, args: PackedStringArray, log_path
 		parts.append(_shell_quote(str(arg)))
 	var redirected := "%s > %s 2>&1" % [" ".join(parts), _shell_quote(log_path)]
 	if OS.get_name() == "Windows":
-		return OS.create_process("cmd.exe", PackedStringArray(["/C", redirected]), false)
-	# Include Docker Desktop bins so helpers like docker-credential-desktop resolve.
+		return OS.create_process(
+			"cmd.exe",
+			PackedStringArray(["/C", _windows_docker_env_export() + redirected]),
+			false
+		)
 	return OS.create_process(
 		"/bin/bash",
-		PackedStringArray(["-c", _unix_path_export() + redirected]),
+		PackedStringArray(["-c", _unix_docker_env_export() + redirected]),
 		false
 	)
 
@@ -275,17 +278,57 @@ func list_local_image_refs() -> PackedStringArray:
 			refs.append(text)
 	return refs
 
-## Match Unity LoginContainerRegistry: docker login -u … --password … registry
+## Match Unity LoginContainerRegistry, but use --password-stdin and an isolated
+## DOCKER_CONFIG so macOS Docker Desktop keychain helpers don't fail under Godot.
 func login_registry(registry_url: String, username: String, password: String) -> bool:
-	var code := _run_docker(PackedStringArray([
-		"login",
-		"-u", username,
-		"--password", password,
-		registry_url,
-	]))
+	var pass_path := _docker_log_path("login.pass")
+	var pass_file := FileAccess.open(pass_path, FileAccess.WRITE)
+	if pass_file == null:
+		EdgegapLogger.error("Could not write temporary Docker login file.")
+		return false
+	pass_file.store_string(password)
+	pass_file.close()
+
+	var output: Array = []
+	var code: int
+	if OS.get_name() == "Windows":
+		var win_cmd := "%stype %s | %s login -u %s --password-stdin %s" % [
+			_windows_docker_env_export(),
+			_shell_quote(pass_path.replace("/", "\\")),
+			_shell_quote(_resolve_docker_bin()),
+			_shell_quote(username),
+			_shell_quote(registry_url),
+		]
+		code = OS.execute("cmd.exe", PackedStringArray(["/C", win_cmd]), output, true, false)
+	else:
+		var cmd := "%s%s login -u %s --password-stdin %s < %s" % [
+			_unix_docker_env_export(),
+			_shell_quote(_resolve_docker_bin()),
+			_shell_quote(username),
+			_shell_quote(registry_url),
+			_shell_quote(pass_path),
+		]
+		code = OS.execute("/bin/bash", PackedStringArray(["-c", cmd]), output, true, false)
+
+	DirAccess.remove_absolute(pass_path)
+	code = _normalize_exit_code(code)
+
+	var combined := ""
+	for line in output:
+		var text := str(line).strip_edges()
+		if text.is_empty():
+			continue
+		combined += text + "\n"
+		EdgegapLogger.info(text)
+
 	if code != 0:
 		EdgegapLogger.error("Docker registry login failed (exit %d)." % code)
+		if not combined.is_empty():
+			EdgegapLogger.error("Docker login output: %s" % combined.strip_edges())
 		return false
+	# Docker Desktop (esp. Windows) often stores creds via wincred/desktop helpers and
+	# leaves auths empty. Write auth into our isolated config so push works without helpers.
+	_persist_registry_auth(registry_url, username, password)
 	EdgegapLogger.info("Docker registry login succeeded: %s" % registry_url)
 	return true
 
@@ -309,6 +352,7 @@ func tag_for_registry(
 
 var _push_pid: int = -1
 var _push_remote_ref := ""
+var _push_log_path := ""
 
 func is_push_running() -> bool:
 	return _push_pid >= 0 and OS.is_process_running(_push_pid)
@@ -318,12 +362,15 @@ func start_push_image(remote_ref: String) -> Error:
 	if is_push_running() or is_build_running():
 		return ERR_BUSY
 	_push_remote_ref = remote_ref
+	# Ensure helper-free config (with persisted auths) is ready before push.
+	_ensure_docker_config_dir()
 	var command_and_args := _docker_command(PackedStringArray(["push", remote_ref]))
 	var command: String = command_and_args[0]
 	var cmd_args: PackedStringArray = command_and_args[1]
-	var push_log := _docker_log_path("docker-push.log")
+	_push_log_path = _docker_log_path("docker-push.log")
 	EdgegapLogger.info("Docker push starting: %s %s" % [command, " ".join(cmd_args)])
-	_push_pid = _create_process_with_log(command, cmd_args, push_log)
+	EdgegapLogger.info("Docker push log: %s" % _push_log_path)
+	_push_pid = _create_process_with_log(command, cmd_args, _push_log_path)
 	if _push_pid < 0:
 		EdgegapLogger.error("Failed to start Docker push process.")
 		_push_pid = -1
@@ -340,6 +387,7 @@ func take_push_exit_code() -> int:
 	_push_pid = -1
 	if code != 0:
 		EdgegapLogger.error("Docker push failed with exit code %d (%s)" % [code, _push_remote_ref])
+		_dump_log_tail(_push_log_path)
 	else:
 		EdgegapLogger.info("Docker image pushed: %s" % _push_remote_ref)
 	return code
@@ -352,23 +400,103 @@ func _execute_docker(args: PackedStringArray, output: Array, quiet: bool = false
 	var command_and_args := _docker_command(args)
 	if not quiet:
 		EdgegapLogger.info("Running: %s %s" % [command_and_args[0], " ".join(command_and_args[1])])
-	if OS.get_name() == "Windows":
-		return OS.execute(command_and_args[0], command_and_args[1], output, true, false)
-	# Run through bash with an augmented PATH so Docker Desktop credential helpers
-	# (docker-credential-desktop) and sibling CLI tools resolve correctly.
 	var parts: PackedStringArray = [_shell_quote(str(command_and_args[0]))]
 	for arg in command_and_args[1]:
 		parts.append(_shell_quote(str(arg)))
+	var cmdline := " ".join(parts)
+	if OS.get_name() == "Windows":
+		return OS.execute(
+			"cmd.exe",
+			PackedStringArray(["/C", _windows_docker_env_export() + cmdline]),
+			output,
+			true,
+			false
+		)
+	# Isolated DOCKER_CONFIG avoids Docker Desktop keychain helpers failing under Godot.
+	# Augmented PATH finds docker-credential-* if still needed for other operations.
 	return OS.execute(
 		"/bin/bash",
-		PackedStringArray(["-c", _unix_path_export() + " ".join(parts)]),
+		PackedStringArray(["-c", _unix_docker_env_export() + cmdline]),
 		output,
 		true,
 		false
 	)
 
-## Directories where Docker Desktop installs the CLI + credential helpers on macOS/Linux.
-func _unix_path_export() -> String:
+## Plugin-owned Docker config without credsStore/credHelpers so login/build/push work
+## when Godot cannot talk to macOS Keychain / docker-credential-desktop.
+func _ensure_docker_config_dir() -> String:
+	var dir := OS.get_cache_dir().path_join("edgegap-godot").path_join("docker-config")
+	DirAccess.make_dir_recursive_absolute(dir)
+	var config_path := dir.path_join("config.json")
+	if not FileAccess.file_exists(config_path):
+		var file := FileAccess.open(config_path, FileAccess.WRITE)
+		if file:
+			file.store_string("{\n  \"auths\": {}\n}\n")
+			file.close()
+		return dir
+	# Keep stored auths, but drop Desktop keychain helpers if Docker added them.
+	_strip_docker_cred_helpers(config_path)
+	return dir
+
+
+func _strip_docker_cred_helpers(config_path: String) -> void:
+	var config := _read_docker_config(config_path)
+	if config.is_empty():
+		return
+	if not config.has("credsStore") and not config.has("credHelpers"):
+		return
+	config.erase("credsStore")
+	config.erase("credHelpers")
+	if typeof(config.get("auths")) != TYPE_DICTIONARY:
+		config["auths"] = {}
+	_write_docker_config(config_path, config)
+
+
+## Store registry auth inline so push does not depend on Desktop credential helpers.
+func _persist_registry_auth(registry_url: String, username: String, password: String) -> void:
+	var config_path := _ensure_docker_config_dir().path_join("config.json")
+	var config := _read_docker_config(config_path)
+	if config.is_empty():
+		config = {"auths": {}}
+	config.erase("credsStore")
+	config.erase("credHelpers")
+	if typeof(config.get("auths")) != TYPE_DICTIONARY:
+		config["auths"] = {}
+	var auths: Dictionary = config["auths"]
+	var auth_b64 := Marshalls.utf8_to_base64("%s:%s" % [username, password])
+	var hosts := PackedStringArray([registry_url])
+	if not registry_url.begins_with("http://") and not registry_url.begins_with("https://"):
+		hosts.append("https://%s" % registry_url)
+	for host in hosts:
+		auths[host] = {"auth": auth_b64}
+	config["auths"] = auths
+	_write_docker_config(config_path, config)
+
+
+func _read_docker_config(config_path: String) -> Dictionary:
+	if not FileAccess.file_exists(config_path):
+		return {}
+	var read := FileAccess.open(config_path, FileAccess.READ)
+	if read == null:
+		return {}
+	var text := read.get_as_text()
+	read.close()
+	var parsed = JSON.parse_string(text)
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return {}
+	return parsed
+
+
+func _write_docker_config(config_path: String, config: Dictionary) -> void:
+	var write := FileAccess.open(config_path, FileAccess.WRITE)
+	if write == null:
+		EdgegapLogger.error("Could not write Docker config: %s" % config_path)
+		return
+	write.store_string(JSON.stringify(config, "\t"))
+	write.close()
+
+func _unix_docker_env_export() -> String:
+	var config_dir := _ensure_docker_config_dir()
 	var home := OS.get_environment("HOME")
 	var dirs := PackedStringArray([
 		"/usr/local/bin",
@@ -379,7 +507,14 @@ func _unix_path_export() -> String:
 	var bin_dir := _resolve_docker_bin().get_base_dir()
 	if not bin_dir.is_empty() and dirs.find(bin_dir) < 0:
 		dirs.insert(0, bin_dir)
-	return 'export PATH="%s:$PATH"; ' % ":".join(dirs)
+	return 'export DOCKER_CONFIG=%s; export PATH="%s:$PATH"; ' % [
+		_shell_quote(config_dir),
+		":".join(dirs),
+	]
+
+func _windows_docker_env_export() -> String:
+	var config_dir := _ensure_docker_config_dir().replace("/", "\\")
+	return "set \"DOCKER_CONFIG=%s\"&& " % config_dir
 
 var _docker_bin := ""
 
