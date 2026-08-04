@@ -278,39 +278,49 @@ func list_local_image_refs() -> PackedStringArray:
 			refs.append(text)
 	return refs
 
-## Match Unity LoginContainerRegistry, but use --password-stdin and an isolated
-## DOCKER_CONFIG so macOS Docker Desktop keychain helpers don't fail under Godot.
+## Match Unity LoginContainerRegistry. Uses isolated DOCKER_CONFIG so Desktop
+## credential helpers don't interfere when Godot spawns Docker.
 func login_registry(registry_url: String, username: String, password: String) -> bool:
-	var pass_path := _docker_log_path("login.pass")
-	var pass_file := FileAccess.open(pass_path, FileAccess.WRITE)
-	if pass_file == null:
-		EdgegapLogger.error("Could not write temporary Docker login file.")
+	registry_url = _normalize_registry_url(registry_url)
+	username = username.strip_edges()
+	password = password.strip_edges()
+	if registry_url.is_empty() or username.is_empty() or password.is_empty():
+		EdgegapLogger.error(
+			"Docker login missing credentials (registry=%s, user=%s, token_len=%d)." % [
+				registry_url, username, password.length()
+			]
+		)
 		return false
-	pass_file.store_string(password)
-	pass_file.close()
 
+	EdgegapLogger.info(
+		"Docker login: registry=%s user=%s token_len=%d" % [
+			registry_url, username, password.length()
+		]
+	)
+
+	# Match Unity: --password with shell-quoted values. --password-stdin via Godot
+	# OS.execute has been unreliable on macOS (empty/unauthorized against Edgegap).
 	var output: Array = []
 	var code: int
 	if OS.get_name() == "Windows":
-		var win_cmd := "%stype %s | %s login -u %s --password-stdin %s" % [
+		var win_cmd := "%s%s login -u %s --password %s %s" % [
 			_windows_docker_env_export(),
-			_shell_quote(pass_path.replace("/", "\\")),
 			_shell_quote(_resolve_docker_bin()),
 			_shell_quote(username),
+			_shell_quote(password),
 			_shell_quote(registry_url),
 		]
 		code = OS.execute("cmd.exe", PackedStringArray(["/C", win_cmd]), output, true, false)
 	else:
-		var cmd := "%s%s login -u %s --password-stdin %s < %s" % [
+		var cmd := "%s%s login -u %s --password %s %s" % [
 			_unix_docker_env_export(),
 			_shell_quote(_resolve_docker_bin()),
 			_shell_quote(username),
+			_shell_quote(password),
 			_shell_quote(registry_url),
-			_shell_quote(pass_path),
 		]
 		code = OS.execute("/bin/bash", PackedStringArray(["-c", cmd]), output, true, false)
 
-	DirAccess.remove_absolute(pass_path)
 	code = _normalize_exit_code(code)
 
 	var combined := ""
@@ -326,11 +336,19 @@ func login_registry(registry_url: String, username: String, password: String) ->
 		if not combined.is_empty():
 			EdgegapLogger.error("Docker login output: %s" % combined.strip_edges())
 		return false
-	# Docker Desktop (esp. Windows) often stores creds via wincred/desktop helpers and
-	# leaves auths empty. Write auth into our isolated config so push works without helpers.
+	# Docker Desktop often stores via wincred/desktop helpers; keep auth in our config.
 	_persist_registry_auth(registry_url, username, password)
 	EdgegapLogger.info("Docker registry login succeeded: %s" % registry_url)
 	return true
+
+
+static func _normalize_registry_url(registry_url: String) -> String:
+	var url := registry_url.strip_edges()
+	if url.begins_with("https://"):
+		url = url.substr("https://".length())
+	elif url.begins_with("http://"):
+		url = url.substr("http://".length())
+	return url.trim_suffix("/")
 
 ## Tag a local image for Edgegap registry push: registry/project/image:tag
 func tag_for_registry(
@@ -340,6 +358,7 @@ func tag_for_registry(
 	image_name: String,
 	image_tag: String
 ) -> String:
+	registry_url = _normalize_registry_url(registry_url)
 	var remote_ref := "%s/%s/%s:%s" % [registry_url, project, image_name, image_tag]
 	if local_ref == remote_ref:
 		return remote_ref
@@ -454,6 +473,7 @@ func _strip_docker_cred_helpers(config_path: String) -> void:
 
 ## Store registry auth inline so push does not depend on Desktop credential helpers.
 func _persist_registry_auth(registry_url: String, username: String, password: String) -> void:
+	registry_url = _normalize_registry_url(registry_url)
 	var config_path := _ensure_docker_config_dir().path_join("config.json")
 	var config := _read_docker_config(config_path)
 	if config.is_empty():
@@ -464,11 +484,8 @@ func _persist_registry_auth(registry_url: String, username: String, password: St
 		config["auths"] = {}
 	var auths: Dictionary = config["auths"]
 	var auth_b64 := Marshalls.utf8_to_base64("%s:%s" % [username, password])
-	var hosts := PackedStringArray([registry_url])
-	if not registry_url.begins_with("http://") and not registry_url.begins_with("https://"):
-		hosts.append("https://%s" % registry_url)
-	for host in hosts:
-		auths[host] = {"auth": auth_b64}
+	auths[registry_url] = {"auth": auth_b64}
+	auths["https://%s" % registry_url] = {"auth": auth_b64}
 	config["auths"] = auths
 	_write_docker_config(config_path, config)
 

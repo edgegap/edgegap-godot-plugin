@@ -101,17 +101,28 @@ func _on_request_completed(result: int, response_code: int, _headers: PackedStri
 		if ok:
 			var parsed: Variant = JSON.parse_string(text)
 			if typeof(parsed) == TYPE_DICTIONARY:
+				var registry_token := str(parsed.get("token", ""))
+				if registry_token.is_empty():
+					registry_token = str(parsed.get("password", ""))
 				credentials = {
 					"registry_url": str(parsed.get("registry_url", "")),
 					"project": str(parsed.get("project", "")),
 					"username": str(parsed.get("username", "")),
-					"token": str(parsed.get("token", "")),
+					"token": registry_token,
 				}
 				EdgegapLogger.info(
-					"Registry credentials loaded (project=%s, registry=%s)." % [
-						credentials.project, credentials.registry_url
+					"Registry credentials loaded (project=%s, registry=%s, user=%s, token_len=%d)." % [
+						credentials.project,
+						credentials.registry_url,
+						credentials.username,
+						str(credentials.token).length(),
 					]
 				)
+				if str(credentials.token).is_empty() or str(credentials.username).is_empty():
+					ok = false
+					EdgegapLogger.error(
+						"Registry credentials incomplete (need username + token). Raw: %s" % text
+					)
 			else:
 				ok = false
 				EdgegapLogger.error("Registry credentials response was not a JSON object.")

@@ -59,7 +59,11 @@ static func get_registry_credentials() -> Dictionary:
 
 static func has_registry_credentials() -> bool:
 	var creds := get_registry_credentials()
-	return not str(creds.registry_url).is_empty() and not str(creds.username).is_empty()
+	return (
+		not str(creds.registry_url).is_empty()
+		and not str(creds.username).is_empty()
+		and not str(creds.token).is_empty()
+	)
 
 static func get_local_container_id() -> String:
 	return str(_editor_settings().get_setting(EdgegapConstants.SETTINGS_LOCAL_CONTAINER_ID))
