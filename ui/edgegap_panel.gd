@@ -35,7 +35,6 @@ var _local_status
 var _upload_status
 var _deploy_status
 
-var _install_templates_btn := Button.new()
 var _validate_templates_btn := Button.new()
 var _export_btn := Button.new()
 var _validate_token_btn := Button.new()
@@ -65,7 +64,6 @@ var _deploy_app_names_popup := PopupMenu.new()
 var _deploy_versions_popup := PopupMenu.new()
 
 var _http := HTTPRequest.new()
-var _templates_http := HTTPRequest.new()
 var _app_http := HTTPRequest.new()
 var _deploy_http := HTTPRequest.new()
 var _auth
@@ -77,7 +75,6 @@ var _app_api
 var _deploy_api
 
 var _awaiting_token_entry := false
-var _templates_downloading := false
 var _exporting := false
 var _export_progress := 0.0
 var _containerizing := false
@@ -135,9 +132,6 @@ func _ready() -> void:
 	_http.request_completed.connect(_on_http_completed)
 	_auth.bind_http(_http)
 	_auth.verified.connect(_on_auth_verified)
-
-	add_child(_templates_http)
-	_templates_http.request_completed.connect(_on_templates_http_completed)
 
 	add_child(_app_http)
 	_app_api.bind_http(_app_http)
@@ -386,12 +380,8 @@ func _build_workflow() -> void:
 	_validate_templates_btn.text = "Validate export templates"
 	_style_secondary(_validate_templates_btn)
 	_set_button_icon(_validate_templates_btn, ["Search"])
-	_validate_templates_btn.pressed.connect(_on_validate_templates)
-	_install_templates_btn.text = "Install templates"
-	_style_secondary(_install_templates_btn)
-	_set_button_icon(_install_templates_btn, ["AssetLib", "Download"])
-	_install_templates_btn.pressed.connect(_on_install_templates)
-	_install_templates_btn.visible = false
+	_validate_templates_btn.tooltip_text = "Check Linux export templates. Opens Godot's template manager if they are missing."
+	_validate_templates_btn.pressed.connect(func(): _on_validate_templates(true))
 	var open_presets := Button.new()
 	open_presets.text = "Open export presets"
 	_style_secondary(open_presets)
@@ -411,7 +401,7 @@ func _build_workflow() -> void:
 	build_actions.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	build_actions.add_theme_constant_override("separation", 4)
 	build_actions.add_child(_button_row(
-		[_validate_templates_btn, open_presets, _install_templates_btn],
+		[_validate_templates_btn, open_presets],
 		[_export_btn]
 	))
 	build_actions.add_child(_templates_status)
@@ -712,17 +702,6 @@ func _on_auth_verified(ok: bool, message: String) -> void:
 		_on_validate_token()
 
 func _process(delta: float) -> void:
-	if _templates_downloading and _templates_status:
-		var total := _templates_http.get_body_size()
-		var got := _templates_http.get_downloaded_bytes()
-		if total > 0:
-			var pct := clampf(10.0 + 60.0 * (float(got) / float(total)), 10.0, 70.0)
-			_templates_status.set_progress(pct, "Downloading… %d / %d MB" % [
-				got / (1024 * 1024), total / (1024 * 1024)
-			])
-		else:
-			_templates_status.set_progress(20, "Downloading… %d MB" % [got / (1024 * 1024)])
-
 	if _exporting:
 		var export_status = _pipeline_status()
 		if _exporter.is_running():
@@ -758,10 +737,9 @@ func _process(delta: float) -> void:
 		else:
 			_finish_push()
 
-func _on_validate_templates() -> void:
+func _on_validate_templates(open_manager_if_missing: bool = false) -> void:
 	_templates_status.bind(_validate_templates_btn)
 	var ok: bool = _templates.is_installed()
-	_install_templates_btn.visible = not ok
 	LoggerScript.info(
 		"Templates check: version=%s dir=%s installed=%s" % [
 			_templates.resolved_version(), _templates.templates_dir(), ok
@@ -772,42 +750,15 @@ func _on_validate_templates() -> void:
 	if ok:
 		_templates_status.set_success("Templates OK.")
 		LoggerScript.info(_templates.status_message())
-	else:
-		_templates_status.set_error("Templates missing — install required.")
-		LoggerScript.warn(_templates.status_message())
-
-func _on_install_templates() -> void:
-	if _templates_downloading:
-		return
-	_templates_status.bind(_install_templates_btn)
-	_templates_downloading = true
-	_install_templates_btn.disabled = true
-	_templates_status.set_busy("Downloading export templates…", 10)
-	var err: Error = _templates.begin_download(_templates_http)
-	if err != OK:
-		_templates_downloading = false
-		_install_templates_btn.disabled = false
-		_templates_status.set_error("Failed to start template download. See Output.")
-
-func _on_templates_http_completed(result: int, response_code: int, _headers: PackedStringArray, _body: PackedByteArray) -> void:
-	_templates_downloading = false
-	_install_templates_btn.disabled = false
-	_templates_http.download_file = ""
-	_templates_status.bind(_install_templates_btn)
-
-	if result != HTTPRequest.RESULT_SUCCESS or response_code < 200 or response_code >= 300:
-		_templates_status.set_error("Download failed (HTTP %d)." % response_code)
-		LoggerScript.error("Template download failed: result=%d http=%d" % [result, response_code])
 		return
 
-	_templates_status.set_busy("Installing export templates…", 80)
-	var err: Error = _templates.install_from_cache()
-	if err != OK:
-		_templates_status.set_error("Install failed. See Output.")
+	LoggerScript.warn(_templates.status_message())
+	if open_manager_if_missing and _templates.open_template_manager():
+		_templates_status.set_error(
+			"Templates missing — use Godot's manager to download, then Validate again."
+		)
 		return
-	_on_validate_templates()
-	_templates_status.bind(_install_templates_btn)
-	_templates_status.set_success("Export templates installed.")
+	_templates_status.set_error("Templates missing — install required.")
 
 func _on_export_server() -> void:
 	if _exporting or _containerizing or _rebuilding or _uploading:
