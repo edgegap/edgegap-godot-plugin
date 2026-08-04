@@ -76,8 +76,12 @@ func start_build_image(
 	var args := PackedStringArray()
 
 	# Match Edgegap Unity: ARM hosts cross-compile with buildx for amd64 Edgegap infra.
+	# --load puts the image in the local Docker store (buildx otherwise only caches it).
+	# Platform comes from optional build params (defaulted on ARM) — do not add it twice.
 	if is_arm_cpu():
-		args.append_array(PackedStringArray(["buildx", "build", "--platform", "linux/amd64"]))
+		args.append_array(PackedStringArray(["buildx", "build", "--load"]))
+		if not _has_platform_flag(build_params):
+			args.append_array(PackedStringArray(["--platform", "linux/amd64"]))
 	else:
 		args.append("build")
 
@@ -108,18 +112,29 @@ func start_build_image(
 	EdgegapLogger.info("Docker build pid=%d" % _build_pid)
 	return OK
 
+static func _has_platform_flag(build_params: String) -> bool:
+	return build_params.find("--platform") >= 0
+
 ## Returns -1 while still running, otherwise the process exit code (and clears pid).
 func take_build_exit_code() -> int:
 	if _build_pid < 0:
 		return FAILED
 	if OS.is_process_running(_build_pid):
 		return -1
-	var code := OS.get_process_exit_code(_build_pid)
+	var code := _normalize_exit_code(OS.get_process_exit_code(_build_pid))
 	_build_pid = -1
 	if code != 0:
 		EdgegapLogger.error("Docker build failed with exit code %d" % code)
 	else:
 		EdgegapLogger.info("Docker image built: %s:%s" % [_build_image_name, _build_image_tag])
+	return code
+
+## Godot on macOS/Linux may return a wait-status (exit << 8) instead of a plain exit code.
+static func _normalize_exit_code(code: int) -> int:
+	if code < 0:
+		return code
+	if code > 255:
+		return (code >> 8) & 0xff
 	return code
 
 func run_container(image_name: String, image_tag: String, run_params: String) -> String:
@@ -269,7 +284,7 @@ func take_push_exit_code() -> int:
 		return FAILED
 	if OS.is_process_running(_push_pid):
 		return -1
-	var code := OS.get_process_exit_code(_push_pid)
+	var code := _normalize_exit_code(OS.get_process_exit_code(_push_pid))
 	_push_pid = -1
 	if code != 0:
 		EdgegapLogger.error("Docker push failed with exit code %d (%s)" % [code, _push_remote_ref])
