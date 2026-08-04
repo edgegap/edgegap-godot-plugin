@@ -1,32 +1,31 @@
 ﻿@tool
 extends EditorPlugin
 
-const PANEL_PATH := "res://addons/edgegap/ui/edgegap_panel.gd"
-
 var _panel: ScrollContainer
 
 func _enter_tree() -> void:
+	var panel_path := (get_script() as Script).resource_path.get_base_dir().path_join("ui/edgegap_panel.gd")
 	# REPLACE_DEEP avoids keeping a previously failed parse cached in ResourceLoader.
 	var panel_script := ResourceLoader.load(
-		PANEL_PATH,
+		panel_path,
 		"GDScript",
 		ResourceLoader.CACHE_MODE_REPLACE_DEEP
 	) as GDScript
 	if panel_script == null:
-		push_error("Edgegap: failed to load %s" % PANEL_PATH)
+		push_error("Edgegap: failed to load %s" % panel_path)
 		return
 
 	var reload_err := panel_script.reload()
 	if reload_err != OK:
 		push_error(
 			"Edgegap: panel script reload failed (%s). Open %s and check Output for parse errors." % [
-				error_string(reload_err), PANEL_PATH
+				error_string(reload_err), panel_path
 			]
 		)
 		return
 	if not panel_script.can_instantiate():
 		push_error(
-			"Edgegap: panel script cannot be instantiated. Open %s and check Output for parse errors." % PANEL_PATH
+			"Edgegap: panel script cannot be instantiated. Open %s and check Output for parse errors." % panel_path
 		)
 		return
 

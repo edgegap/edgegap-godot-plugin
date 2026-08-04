@@ -3,15 +3,15 @@
 importer="texture"
 type="CompressedTexture2D"
 uid="uid://cl3liachj5xwc"
-path="res://.godot/imported/banner.png-48cde0dbff3e33b791397f28a8e92422.ctex"
+path="res://.godot/imported/banner.png-2948b8b93f05c1e645906083319e499a.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://addons/edgegap/assets/banner.png"
-dest_files=["res://.godot/imported/banner.png-48cde0dbff3e33b791397f28a8e92422.ctex"]
+source_file="res://addons/edgegap-godot-plugin/assets/banner.png"
+dest_files=["res://.godot/imported/banner.png-2948b8b93f05c1e645906083319e499a.ctex"]
 
 [params]
 
