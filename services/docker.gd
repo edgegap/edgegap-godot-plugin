@@ -287,15 +287,51 @@ func _execute_docker(args: PackedStringArray, output: Array, quiet: bool = false
 		EdgegapLogger.info("Running: %s %s" % [command_and_args[0], " ".join(command_and_args[1])])
 	return OS.execute(command_and_args[0], command_and_args[1], output, true, false)
 
-## Windows: `docker …` directly.
-## macOS/Linux: `/bin/bash -c "docker …"` so login-shell PATH/aliases resolve (same as Unity plugin).
-func _docker_command(docker_args: PackedStringArray) -> Array:
-	if OS.get_name() == "Windows":
-		return ["docker", docker_args]
-	var shell := "docker"
-	for arg in docker_args:
-		shell += " " + _shell_quote(str(arg))
-	return ["/bin/bash", PackedStringArray(["-c", shell])]
+var _docker_bin := ""
 
-func _shell_quote(value: String) -> String:
-	return "'%s'" % value.replace("'", "'\"'\"'")
+## Resolve the Docker CLI once. Godot (and other GUI apps) on macOS often lack the
+## user shell PATH, so plain `docker` looks "not installed" even when Docker Desktop runs.
+func _resolve_docker_bin() -> String:
+	if not _docker_bin.is_empty():
+		return _docker_bin
+
+	if OS.get_name() == "Windows":
+		_docker_bin = "docker"
+		return _docker_bin
+
+	var home := OS.get_environment("HOME")
+	var candidates := PackedStringArray([
+		"/usr/local/bin/docker",
+		"/opt/homebrew/bin/docker",
+		home.path_join(".docker/bin/docker"),
+		"/Applications/Docker.app/Contents/Resources/bin/docker",
+	])
+	for path in candidates:
+		if not path.is_empty() and FileAccess.file_exists(path):
+			_docker_bin = path
+			EdgegapLogger.info("Using Docker CLI at %s" % _docker_bin)
+			return _docker_bin
+
+	# Login shell picks up ~/.zprofile / ~/.bash_profile PATH customizations.
+	var which_out: Array = []
+	var which_code := OS.execute(
+		"/bin/bash",
+		PackedStringArray(["-lc", "command -v docker"]),
+		which_out,
+		true,
+		false
+	)
+	if which_code == 0 and not which_out.is_empty():
+		var found := str(which_out[0]).strip_edges()
+		if not found.is_empty() and FileAccess.file_exists(found):
+			_docker_bin = found
+			EdgegapLogger.info("Using Docker CLI at %s" % _docker_bin)
+			return _docker_bin
+
+	_docker_bin = "docker"
+	return _docker_bin
+
+## Prefer an absolute Docker binary on macOS/Linux so PATH does not matter.
+## Windows keeps `docker` on PATH (Docker Desktop).
+func _docker_command(docker_args: PackedStringArray) -> Array:
+	return [_resolve_docker_bin(), docker_args]
