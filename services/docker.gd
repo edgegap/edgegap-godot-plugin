@@ -159,7 +159,12 @@ func _create_process_with_log(command: String, args: PackedStringArray, log_path
 	var redirected := "%s > %s 2>&1" % [" ".join(parts), _shell_quote(log_path)]
 	if OS.get_name() == "Windows":
 		return OS.create_process("cmd.exe", PackedStringArray(["/C", redirected]), false)
-	return OS.create_process("/bin/bash", PackedStringArray(["-c", redirected]), false)
+	# Include Docker Desktop bins so helpers like docker-credential-desktop resolve.
+	return OS.create_process(
+		"/bin/bash",
+		PackedStringArray(["-c", _unix_path_export() + redirected]),
+		false
+	)
 
 func _dump_log_tail(log_path: String, max_lines: int = 50) -> void:
 	if log_path.is_empty() or not FileAccess.file_exists(log_path):
@@ -316,8 +321,9 @@ func start_push_image(remote_ref: String) -> Error:
 	var command_and_args := _docker_command(PackedStringArray(["push", remote_ref]))
 	var command: String = command_and_args[0]
 	var cmd_args: PackedStringArray = command_and_args[1]
+	var push_log := _docker_log_path("docker-push.log")
 	EdgegapLogger.info("Docker push starting: %s %s" % [command, " ".join(cmd_args)])
-	_push_pid = OS.create_process(command, cmd_args, false)
+	_push_pid = _create_process_with_log(command, cmd_args, push_log)
 	if _push_pid < 0:
 		EdgegapLogger.error("Failed to start Docker push process.")
 		_push_pid = -1
@@ -346,7 +352,34 @@ func _execute_docker(args: PackedStringArray, output: Array, quiet: bool = false
 	var command_and_args := _docker_command(args)
 	if not quiet:
 		EdgegapLogger.info("Running: %s %s" % [command_and_args[0], " ".join(command_and_args[1])])
-	return OS.execute(command_and_args[0], command_and_args[1], output, true, false)
+	if OS.get_name() == "Windows":
+		return OS.execute(command_and_args[0], command_and_args[1], output, true, false)
+	# Run through bash with an augmented PATH so Docker Desktop credential helpers
+	# (docker-credential-desktop) and sibling CLI tools resolve correctly.
+	var parts: PackedStringArray = [_shell_quote(str(command_and_args[0]))]
+	for arg in command_and_args[1]:
+		parts.append(_shell_quote(str(arg)))
+	return OS.execute(
+		"/bin/bash",
+		PackedStringArray(["-c", _unix_path_export() + " ".join(parts)]),
+		output,
+		true,
+		false
+	)
+
+## Directories where Docker Desktop installs the CLI + credential helpers on macOS/Linux.
+func _unix_path_export() -> String:
+	var home := OS.get_environment("HOME")
+	var dirs := PackedStringArray([
+		"/usr/local/bin",
+		"/opt/homebrew/bin",
+		home.path_join(".docker/bin"),
+		"/Applications/Docker.app/Contents/Resources/bin",
+	])
+	var bin_dir := _resolve_docker_bin().get_base_dir()
+	if not bin_dir.is_empty() and dirs.find(bin_dir) < 0:
+		dirs.insert(0, bin_dir)
+	return 'export PATH="%s:$PATH"; ' % ":".join(dirs)
 
 var _docker_bin := ""
 
