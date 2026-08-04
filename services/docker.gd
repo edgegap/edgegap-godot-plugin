@@ -283,18 +283,18 @@ func list_local_image_refs() -> PackedStringArray:
 			refs.append(text)
 	return refs
 
-## Match Unity LoginContainerRegistry. Uses isolated DOCKER_CONFIG so Desktop
-## credential helpers don't interfere when Godot spawns Docker.
-##
-## Important: Harbor robot usernames contain `$` (e.g. robot$project+name). Never pass
-## them through an interpolated shell string — use argv so `$` cannot expand.
+## Match the known-working terminal form:
+##   echo '<token>' | docker login registry.edgegap.com -u 'robot$…' --password-stdin
+## Uses default ~/.docker (no DOCKER_CONFIG override) — isolated config made Edgegap
+## return unauthorized even with the same username/token. Harbor `$` in usernames is
+## passed via bash/cmd positional args so the shell cannot expand it.
 func login_registry(registry_url: String, username: String, password: String) -> bool:
 	registry_url = _normalize_registry_url(registry_url)
 	username = username.strip_edges()
 	password = password.strip_edges()
 	if registry_url.is_empty() or username.is_empty() or password.is_empty():
 		EdgegapLogger.error(
-			"Docker login missing credentials (registry=%s, user=%s, token_len=%d)." % [
+			"Docker registry auth missing (registry=%s, user=%s, token_len=%d)." % [
 				registry_url, username, password.length()
 			]
 		)
@@ -306,12 +306,47 @@ func login_registry(registry_url: String, username: String, password: String) ->
 		]
 	)
 
+	# Always write helper-free auth for push (Godot may not read Desktop keychain).
+	var persisted := _persist_registry_auth(registry_url, username, password)
+
 	var output: Array = []
-	var code := _execute_docker_argv(
-		PackedStringArray(["login", "-u", username, "--password", password, registry_url]),
-		output,
-		false
-	)
+	var code: int
+	var previous_docker_config := OS.get_environment("DOCKER_CONFIG")
+	# Critical: use default Docker config like the working terminal command.
+	OS.set_environment("DOCKER_CONFIG", "")
+
+	if OS.get_name() == "Windows":
+		var pass_path := _docker_log_path("login.pass")
+		var pass_file := FileAccess.open(pass_path, FileAccess.WRITE)
+		if pass_file == null:
+			_restore_env("DOCKER_CONFIG", previous_docker_config)
+			EdgegapLogger.error("Could not write temporary Docker login file.")
+			return persisted
+		# echo adds a trailing newline; Docker expects the same via --password-stdin.
+		pass_file.store_string(password + "\n")
+		pass_file.close()
+		var win_cmd := "type %s | %s login %s -u %s --password-stdin" % [
+			_shell_quote(pass_path.replace("/", "\\")),
+			_shell_quote(_resolve_docker_bin()),
+			_shell_quote(registry_url),
+			_shell_quote(username),
+		]
+		code = OS.execute("cmd.exe", PackedStringArray(["/C", win_cmd]), output, true, false)
+		DirAccess.remove_absolute(pass_path)
+	else:
+		# $0=_; $1=token; $2=registry; $3=username — values never re-parsed as shell.
+		# GDScript '%%' → '%' so bash sees printf '%s\n'.
+		var script := "printf '%%s\\n' \"$1\" | %s login \"$2\" -u \"$3\" --password-stdin" % \
+			_shell_quote(_resolve_docker_bin())
+		code = OS.execute(
+			"/bin/bash",
+			PackedStringArray(["-c", script, "_", password, registry_url, username]),
+			output,
+			true,
+			false
+		)
+
+	_restore_env("DOCKER_CONFIG", previous_docker_config)
 	code = _normalize_exit_code(code)
 
 	var combined := ""
@@ -319,24 +354,24 @@ func login_registry(registry_url: String, username: String, password: String) ->
 		var text := str(line).strip_edges()
 		if text.is_empty():
 			continue
-		# Docker always warns about --password; keep the useful lines.
 		if text.begins_with("WARNING! Using --password"):
 			continue
 		combined += text + "\n"
 		EdgegapLogger.info(text)
 
-	if code != 0:
-		EdgegapLogger.error("Docker registry login failed (exit %d)." % code)
-		if not combined.is_empty():
-			EdgegapLogger.error("Docker login output: %s" % combined.strip_edges())
-		EdgegapLogger.error(
-			"If this keeps failing, open Edgegap Dashboard → Container Registry, confirm the robot username/token, then re-validate your API token in the plugin."
+	if code == 0:
+		EdgegapLogger.info("Docker registry login succeeded: %s" % registry_url)
+		return true
+
+	EdgegapLogger.error("Docker registry login failed (exit %d)." % code)
+	if not combined.is_empty():
+		EdgegapLogger.error("Docker login output: %s" % combined.strip_edges())
+	if persisted:
+		EdgegapLogger.warn(
+			"Continuing with inline Docker config auth for push (login CLI failed)."
 		)
-		return false
-	# Docker Desktop often stores via wincred/desktop helpers; keep auth in our config.
-	_persist_registry_auth(registry_url, username, password)
-	EdgegapLogger.info("Docker registry login succeeded: %s" % registry_url)
-	return true
+		return true
+	return false
 
 
 static func _normalize_registry_url(registry_url: String) -> String:
@@ -420,12 +455,27 @@ func _execute_docker(args: PackedStringArray, output: Array, quiet: bool = false
 func _execute_docker_argv(args: PackedStringArray, output: Array, quiet: bool = false) -> int:
 	var docker := _resolve_docker_bin()
 	if not quiet:
-		EdgegapLogger.info("Running: %s %s" % [docker, " ".join(args)])
+		EdgegapLogger.info("Running: %s %s" % [docker, " ".join(_redact_docker_args(args))])
 	var previous := OS.get_environment("DOCKER_CONFIG")
 	OS.set_environment("DOCKER_CONFIG", _ensure_docker_config_dir())
 	var code := OS.execute(docker, args, output, true, false)
 	_restore_env("DOCKER_CONFIG", previous)
 	return code
+
+static func _redact_docker_args(args: PackedStringArray) -> PackedStringArray:
+	var redacted: PackedStringArray = []
+	var hide_next := false
+	for arg in args:
+		if hide_next:
+			redacted.append("***")
+			hide_next = false
+			continue
+		if arg == "--password" or arg == "-p":
+			redacted.append(arg)
+			hide_next = true
+			continue
+		redacted.append(arg)
+	return redacted
 
 func _restore_env(name: String, previous: String) -> void:
 	if previous.is_empty():
@@ -464,22 +514,29 @@ func _strip_docker_cred_helpers(config_path: String) -> void:
 
 
 ## Store registry auth inline so push does not depend on Desktop credential helpers.
-func _persist_registry_auth(registry_url: String, username: String, password: String) -> void:
+## Overwrites config.json (no credsStore) so Harbor robot`$` usernames stay exact.
+func _persist_registry_auth(registry_url: String, username: String, password: String) -> bool:
 	registry_url = _normalize_registry_url(registry_url)
-	var config_path := _ensure_docker_config_dir().path_join("config.json")
-	var config := _read_docker_config(config_path)
-	if config.is_empty():
-		config = {"auths": {}}
-	config.erase("credsStore")
-	config.erase("credHelpers")
-	if typeof(config.get("auths")) != TYPE_DICTIONARY:
-		config["auths"] = {}
-	var auths: Dictionary = config["auths"]
+	var dir := OS.get_cache_dir().path_join("edgegap-godot").path_join("docker-config")
+	DirAccess.make_dir_recursive_absolute(dir)
+	var config_path := dir.path_join("config.json")
 	var auth_b64 := Marshalls.utf8_to_base64("%s:%s" % [username, password])
-	auths[registry_url] = {"auth": auth_b64}
-	auths["https://%s" % registry_url] = {"auth": auth_b64}
-	config["auths"] = auths
+	var config := {
+		"auths": {
+			registry_url: {"auth": auth_b64},
+			"https://%s" % registry_url: {"auth": auth_b64},
+		}
+	}
 	_write_docker_config(config_path, config)
+	# Verify round-trip so we don't push with an empty/broken config.
+	var verify := _read_docker_config(config_path)
+	var auths: Variant = verify.get("auths", {})
+	if typeof(auths) != TYPE_DICTIONARY:
+		return false
+	var entry: Variant = auths.get(registry_url, {})
+	if typeof(entry) != TYPE_DICTIONARY:
+		return false
+	return str(entry.get("auth", "")) == auth_b64
 
 
 func _read_docker_config(config_path: String) -> Dictionary:
