@@ -153,21 +153,26 @@ func _docker_log_path(filename: String) -> String:
 	return cache_dir.path_join(filename)
 
 func _create_process_with_log(command: String, args: PackedStringArray, log_path: String) -> int:
+	# Quote every argv so `$` / spaces in image refs cannot expand.
 	var parts: PackedStringArray = [_shell_quote(command)]
 	for arg in args:
 		parts.append(_shell_quote(str(arg)))
-	var redirected := "%s > %s 2>&1" % [" ".join(parts), _shell_quote(log_path)]
+	var cmdline := " ".join(parts)
+	var config_dir := _ensure_docker_config_dir()
 	if OS.get_name() == "Windows":
-		return OS.create_process(
-			"cmd.exe",
-			PackedStringArray(["/C", _windows_docker_env_export() + redirected]),
-			false
-		)
-	return OS.create_process(
-		"/bin/bash",
-		PackedStringArray(["-c", _unix_docker_env_export() + redirected]),
-		false
-	)
+		var win := "set \"DOCKER_CONFIG=%s\"&& %s > %s 2>&1" % [
+			config_dir.replace("/", "\\"),
+			cmdline,
+			_shell_quote(log_path.replace("/", "\\")),
+		]
+		return OS.create_process("cmd.exe", PackedStringArray(["/C", win]), false)
+	# Inline env assignment — reliable for async create_process (no set_environment race).
+	var unix := "DOCKER_CONFIG=%s %s > %s 2>&1" % [
+		_shell_quote(config_dir),
+		cmdline,
+		_shell_quote(log_path),
+	]
+	return OS.create_process("/bin/bash", PackedStringArray(["-c", unix]), false)
 
 func _dump_log_tail(log_path: String, max_lines: int = 50) -> void:
 	if log_path.is_empty() or not FileAccess.file_exists(log_path):
@@ -280,6 +285,9 @@ func list_local_image_refs() -> PackedStringArray:
 
 ## Match Unity LoginContainerRegistry. Uses isolated DOCKER_CONFIG so Desktop
 ## credential helpers don't interfere when Godot spawns Docker.
+##
+## Important: Harbor robot usernames contain `$` (e.g. robot$project+name). Never pass
+## them through an interpolated shell string — use argv so `$` cannot expand.
 func login_registry(registry_url: String, username: String, password: String) -> bool:
 	registry_url = _normalize_registry_url(registry_url)
 	username = username.strip_edges()
@@ -298,35 +306,21 @@ func login_registry(registry_url: String, username: String, password: String) ->
 		]
 	)
 
-	# Match Unity: --password with shell-quoted values. --password-stdin via Godot
-	# OS.execute has been unreliable on macOS (empty/unauthorized against Edgegap).
 	var output: Array = []
-	var code: int
-	if OS.get_name() == "Windows":
-		var win_cmd := "%s%s login -u %s --password %s %s" % [
-			_windows_docker_env_export(),
-			_shell_quote(_resolve_docker_bin()),
-			_shell_quote(username),
-			_shell_quote(password),
-			_shell_quote(registry_url),
-		]
-		code = OS.execute("cmd.exe", PackedStringArray(["/C", win_cmd]), output, true, false)
-	else:
-		var cmd := "%s%s login -u %s --password %s %s" % [
-			_unix_docker_env_export(),
-			_shell_quote(_resolve_docker_bin()),
-			_shell_quote(username),
-			_shell_quote(password),
-			_shell_quote(registry_url),
-		]
-		code = OS.execute("/bin/bash", PackedStringArray(["-c", cmd]), output, true, false)
-
+	var code := _execute_docker_argv(
+		PackedStringArray(["login", "-u", username, "--password", password, registry_url]),
+		output,
+		false
+	)
 	code = _normalize_exit_code(code)
 
 	var combined := ""
 	for line in output:
 		var text := str(line).strip_edges()
 		if text.is_empty():
+			continue
+		# Docker always warns about --password; keep the useful lines.
+		if text.begins_with("WARNING! Using --password"):
 			continue
 		combined += text + "\n"
 		EdgegapLogger.info(text)
@@ -335,6 +329,9 @@ func login_registry(registry_url: String, username: String, password: String) ->
 		EdgegapLogger.error("Docker registry login failed (exit %d)." % code)
 		if not combined.is_empty():
 			EdgegapLogger.error("Docker login output: %s" % combined.strip_edges())
+		EdgegapLogger.error(
+			"If this keeps failing, open Edgegap Dashboard → Container Registry, confirm the robot username/token, then re-validate your API token in the plugin."
+		)
 		return false
 	# Docker Desktop often stores via wincred/desktop helpers; keep auth in our config.
 	_persist_registry_auth(registry_url, username, password)
@@ -413,33 +410,28 @@ func take_push_exit_code() -> int:
 
 func _run_docker(args: PackedStringArray, quiet: bool = true) -> int:
 	var output: Array = []
-	return _execute_docker(args, output, quiet)
+	return _execute_docker_argv(args, output, quiet)
 
 func _execute_docker(args: PackedStringArray, output: Array, quiet: bool = false) -> int:
-	var command_and_args := _docker_command(args)
+	return _execute_docker_argv(args, output, quiet)
+
+## Run docker with argv (no shell) so Harbor usernames with `$` stay intact.
+## Sets DOCKER_CONFIG on the Godot process so the child inherits it.
+func _execute_docker_argv(args: PackedStringArray, output: Array, quiet: bool = false) -> int:
+	var docker := _resolve_docker_bin()
 	if not quiet:
-		EdgegapLogger.info("Running: %s %s" % [command_and_args[0], " ".join(command_and_args[1])])
-	var parts: PackedStringArray = [_shell_quote(str(command_and_args[0]))]
-	for arg in command_and_args[1]:
-		parts.append(_shell_quote(str(arg)))
-	var cmdline := " ".join(parts)
-	if OS.get_name() == "Windows":
-		return OS.execute(
-			"cmd.exe",
-			PackedStringArray(["/C", _windows_docker_env_export() + cmdline]),
-			output,
-			true,
-			false
-		)
-	# Isolated DOCKER_CONFIG avoids Docker Desktop keychain helpers failing under Godot.
-	# Augmented PATH finds docker-credential-* if still needed for other operations.
-	return OS.execute(
-		"/bin/bash",
-		PackedStringArray(["-c", _unix_docker_env_export() + cmdline]),
-		output,
-		true,
-		false
-	)
+		EdgegapLogger.info("Running: %s %s" % [docker, " ".join(args)])
+	var previous := OS.get_environment("DOCKER_CONFIG")
+	OS.set_environment("DOCKER_CONFIG", _ensure_docker_config_dir())
+	var code := OS.execute(docker, args, output, true, false)
+	_restore_env("DOCKER_CONFIG", previous)
+	return code
+
+func _restore_env(name: String, previous: String) -> void:
+	if previous.is_empty():
+		OS.set_environment(name, "")
+	else:
+		OS.set_environment(name, previous)
 
 ## Plugin-owned Docker config without credsStore/credHelpers so login/build/push work
 ## when Godot cannot talk to macOS Keychain / docker-credential-desktop.
@@ -511,27 +503,6 @@ func _write_docker_config(config_path: String, config: Dictionary) -> void:
 		return
 	write.store_string(JSON.stringify(config, "\t"))
 	write.close()
-
-func _unix_docker_env_export() -> String:
-	var config_dir := _ensure_docker_config_dir()
-	var home := OS.get_environment("HOME")
-	var dirs := PackedStringArray([
-		"/usr/local/bin",
-		"/opt/homebrew/bin",
-		home.path_join(".docker/bin"),
-		"/Applications/Docker.app/Contents/Resources/bin",
-	])
-	var bin_dir := _resolve_docker_bin().get_base_dir()
-	if not bin_dir.is_empty() and dirs.find(bin_dir) < 0:
-		dirs.insert(0, bin_dir)
-	return 'export DOCKER_CONFIG=%s; export PATH="%s:$PATH"; ' % [
-		_shell_quote(config_dir),
-		":".join(dirs),
-	]
-
-func _windows_docker_env_export() -> String:
-	var config_dir := _ensure_docker_config_dir().replace("/", "\\")
-	return "set \"DOCKER_CONFIG=%s\"&& " % config_dir
 
 var _docker_bin := ""
 
