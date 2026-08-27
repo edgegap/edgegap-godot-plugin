@@ -203,7 +203,10 @@ func run_container(image_name: String, image_tag: String, run_params: String) ->
 		)
 		return ""
 
-	var args := PackedStringArray(["run", "-d", "--rm"])
+	_remove_previous_container()
+
+	# No --rm: a crashed server must stay inspectable via `docker logs`.
+	var args := PackedStringArray(["run", "-d"])
 	if is_arm_cpu():
 		args.append_array(PackedStringArray(["--platform", "linux/amd64"]))
 	for part in run_params.split(" ", false):
@@ -223,6 +226,24 @@ func run_container(image_name: String, image_tag: String, run_params: String) ->
 	EdgegapLogger.info("Started container %s" % container_id)
 	return container_id
 
+## An exited container is kept so its logs stay readable; it is discarded only
+## once a new run replaces it.
+func _remove_previous_container() -> void:
+	var id: String = EdgegapSettings.get_local_container_id()
+	if id.is_empty():
+		return
+
+	var output: Array = []
+	var code := _execute_docker(PackedStringArray(["rm", "-f", id]), output, true)
+	EdgegapSettings.clear_local_container_id()
+	if code == 0:
+		EdgegapLogger.info("Removed previous local container %s." % id)
+		return
+	if not _mentions_missing_container(output):
+		EdgegapLogger.warn("Could not remove previous local container %s (exit %d)." % [id, code])
+
+## The id is kept for an exited container so it can still be inspected and cleaned
+## up; it is only forgotten once Docker no longer knows the container at all.
 func is_plugin_container_running() -> bool:
 	var id: String = EdgegapSettings.get_local_container_id()
 	if id.is_empty():
@@ -236,23 +257,40 @@ func is_plugin_container_running() -> bool:
 	if code != 0:
 		EdgegapSettings.clear_local_container_id()
 		return false
-	var running := " ".join(PackedStringArray(output)).strip_edges().to_lower() == "true"
-	if not running:
-		EdgegapSettings.clear_local_container_id()
-	return running
+	return " ".join(PackedStringArray(output)).strip_edges().to_lower() == "true"
 
 func terminate_plugin_container() -> bool:
 	var id: String = EdgegapSettings.get_local_container_id()
 	if id.is_empty():
 		EdgegapLogger.info("No plugin container to terminate.")
 		return false
+
 	var rm_out: Array = []
-	_execute_docker(PackedStringArray(["rm", "-f", id]), rm_out)
-	for line in rm_out:
-		EdgegapLogger.info(str(line))
+	var code := _execute_docker(PackedStringArray(["rm", "-f", id]), rm_out)
 	EdgegapSettings.clear_local_container_id()
-	EdgegapLogger.info("Terminated plugin container %s." % id)
-	return true
+
+	if code == 0:
+		for line in rm_out:
+			EdgegapLogger.info(str(line))
+		EdgegapLogger.info("Terminated plugin container %s." % id)
+		return true
+
+	# The container may have been removed outside the plugin (docker rm, prune),
+	# which leaves the stored id dangling but still reaches the desired end state.
+	if _mentions_missing_container(rm_out):
+		EdgegapLogger.info("Plugin container %s no longer exists." % id)
+		return true
+
+	for line in rm_out:
+		EdgegapLogger.error(str(line))
+	EdgegapLogger.error("Failed to terminate plugin container %s (exit %d)." % [id, code])
+	return false
+
+static func _mentions_missing_container(output: Array) -> bool:
+	for line in output:
+		if str(line).to_lower().contains("no such container"):
+			return true
+	return false
 
 ## Returns local image refs as "repository:tag" (skips dangling <none> entries).
 func list_local_image_refs() -> PackedStringArray:
@@ -470,7 +508,8 @@ static func _redact_docker_args(args: PackedStringArray) -> PackedStringArray:
 			redacted.append("***")
 			hide_next = false
 			continue
-		if arg == "--password" or arg == "-p":
+		# Only `docker login` takes a secret here; `-p` on `docker run` is a port mapping.
+		if arg == "--password":
 			redacted.append(arg)
 			hide_next = true
 			continue
