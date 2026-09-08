@@ -2,7 +2,7 @@
 
 Editor plugin to export a Linux dedicated server, containerize it with Docker, upload to Edgegap, and deploy a quickstart server.
 
-Supports **Godot 4.x** on **Windows**, **macOS**, and **Linux**.
+Supports **Godot 4.3.x** and newer on **Windows**, **macOS**, and **Linux**.
 
 This plugin is intended to help you:
 
